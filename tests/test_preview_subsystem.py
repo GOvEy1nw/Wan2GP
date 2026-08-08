@@ -362,6 +362,65 @@ class PreviewSubsystemTests(unittest.TestCase):
         self.assertEqual(decoded_count, 17)
         self.assertTrue(_torch.equal(latent, original))
 
+    @unittest.skipUnless(_torch is not None, "torch runtime unavailable")
+    def test_euler_callback_uses_postprocessed_denoised_latent(self):
+        source = Path("models/ltx2/ltx_pipelines/utils/helpers.py").read_text(encoding="utf-8")
+        functions = {node.name: node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)}
+        module = ast.Module(
+            body=ast.parse("from __future__ import annotations").body
+            + [functions["_invoke_callback"], functions["euler_denoising_loop"]],
+            type_ignores=[],
+        )
+
+        class Offload:
+            @staticmethod
+            def set_step_no_for_lora(transformer, step_idx):
+                pass
+
+        namespace = {
+            "offload": Offload,
+            "post_process_latent": lambda denoised, denoise_mask, clean_latent: denoised + 10,
+            "replace": replace,
+            "tqdm": lambda steps: steps,
+        }
+        exec(compile(ast.fix_missing_locations(module), "models/ltx2/ltx_pipelines/utils/helpers.py", "exec"), namespace)
+
+        @dataclass(frozen=True)
+        class State:
+            latent: Any
+            clean_latent: Any = None
+            denoise_mask: Any = None
+
+        class PreviewTools:
+            @staticmethod
+            def clear_conditioning(state):
+                return state
+
+            @staticmethod
+            def unpatchify(state):
+                return state
+
+        class Stepper:
+            @staticmethod
+            def step(sample, denoised, sigmas, step_idx):
+                return denoised + 100
+
+        captured = []
+        final_video, _ = namespace["euler_denoising_loop"](
+            _torch.tensor([1.0, 0.0]),
+            State(_torch.tensor([1.0])),
+            None,
+            Stepper(),
+            lambda video_state, audio_state, sigmas, step_idx: (_torch.tensor([3.0]), None),
+            callback=lambda step, latent, is_final, *, pass_no: captured.append((step, latent, is_final, pass_no)),
+            preview_tools=PreviewTools(),
+            pass_no=7,
+        )
+
+        self.assertEqual([(step, is_final, pass_no) for step, _, is_final, pass_no in captured], [(0, False, 7)])
+        self.assertTrue(_torch.equal(captured[0][1], _torch.tensor(13.0)))
+        self.assertTrue(_torch.equal(final_video.latent, _torch.tensor([113.0])))
+
     @unittest.skipUnless(_torch is not None and _safetensors is not None and os.getenv("WANGP_PREVIEW_FIXTURE_TEST"), "opt-in torch fixture test")
     def test_strict_loader_accepts_a_matching_safetensors_fixture(self):
         from safetensors.torch import save_file

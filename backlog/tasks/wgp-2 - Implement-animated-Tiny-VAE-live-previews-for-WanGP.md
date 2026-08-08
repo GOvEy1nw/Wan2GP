@@ -5,7 +5,7 @@ status: Human Review
 assignee:
   - '@Codex'
 created_date: '2026-08-06 16:35'
-updated_date: '2026-08-07 14:36'
+updated_date: '2026-08-08 12:33'
 labels: []
 dependencies: []
 references:
@@ -91,6 +91,8 @@ Implement the complete animated Tiny VAE live-preview feature described in WanGP
 3. Encode multi-frame previews independently with lazy PyAV fragmented H.264/NVENC, falling back to animated WebP without the old 4 MiB/frame-reduction policy; retain the existing bounded latest-wins worker.
 4. Render MP4 previews as autoplaying muted looping video while preserving first-frame compatibility and structured API/CLI/MCP media.
 5. Update configuration/help/API docs and focused tests, then run a real NVENC synthetic-preview smoke plus the existing preview suite and compile/diff checks.
+
+Repair LTX preview callbacks: pass each loop's post-processed denoised prediction through the existing conditioning-clear/unpatchify bridge before advancing the sampler state; add focused regression coverage for Euler, gradient-Euler, and Res2S; verify with the isolated CUDA preview suite and a fixed-seed runtime smoke.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
@@ -173,6 +175,8 @@ Multi-frame transport now prefers in-memory fragmented H.264/NVENC MP4 and retai
 Final evidence: focused preview suite 23 passed with 1 expected dependency skip; targeted py_compile and scoped diff checks passed; real 160-frame 512x288 NVENC smoke encoded video/mp4, decoded all 160 frames at stream rate 16, reported 10,000 ms, and produced 308,318 bytes. Independent reviewer verdict: ship.
 
 Live WanGP launch was attempted in the validated environment. The runtime remained CPU-bound building the large app stack for about seven minutes without errors or opening port 7860; user asked to stop and will perform browser testing later. Both launcher/runtime processes and temporary logs were removed. WebUI acceptance criteria 1 and 5 remain unchecked pending that manual test.
+
+Fixed #0035: every LTX sampler preview callback now uses a transient post-processed denoised latent before sampler advancement (Euler, gradient Euler, and Res2S). The actual sampler state, callback metadata, and final output path are unchanged. Evidence: C:\tmp\wangp-preview-venv\Scripts\python.exe -m unittest discover -s tests -p test_preview_subsystem.py => 24 passed, 1 expected skip; targeted py_compile and git diff --check passed. Independent review verdict: ship. Remaining verification: user visual retest with the supplied LTX workload.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
