@@ -166,6 +166,7 @@ class PreviewSubsystemTests(unittest.TestCase):
         rendered = preview_media_to_html(media)
         self.assertIn("<video", rendered)
         self.assertIn("autoplay loop muted playsinline", rendered)
+        self.assertRegex(rendered, r'data-preview-generation="g" ontimeupdate="[^"]*window\.__wangpPreviewPlayback[^"]*" onloadedmetadata="[^"]*window\.__wangpPreviewPlayback[^"]*"')
         self.assertNotIn("showImageModal", rendered)
 
     def test_encoder_reports_static_when_frames_have_no_temporal_change(self):
