@@ -3474,10 +3474,10 @@ def get_loras_preprocessor(transformer, model_type):
     return preprocessor_wrapper    
 
 
-def process_files_def(repoId = None, sourceFolderList = None, fileList = None, targetFolderList = None):
+def process_files_def(repoId = None, sourceFolderList = None, fileList = None, targetFolderList = None, progress_callback = None):
     from shared.utils.download import process_files_def as shared_process_files_def
 
-    return shared_process_files_def(repoId=repoId, sourceFolderList=sourceFolderList, fileList=fileList, targetFolderList=targetFolderList)
+    return shared_process_files_def(repoId=repoId, sourceFolderList=sourceFolderList, fileList=fileList, targetFolderList=targetFolderList, progress_callback=progress_callback)
 
 def release_flashvsr_vram():
     upsampler_api.require_upsampler_by_method("flashvsr").release_vram()
@@ -3503,10 +3503,10 @@ def download_requested_postprocessing_assets(send_cmd, *, postprocess_audio="", 
         edit_upsampler.download(process_files_def, send_cmd=send_cmd, status_text=f"Downloading {edit_upsampler.query_upsampler_def().get('name', 'postprocessing')} model files...", spatial_upsampling=spatial_upsampling)
 
 
-def download_file(url,filename):
+def download_file(url,filename, progress_callback=None):
     from shared.utils.download import download_file as shared_download_file
 
-    return shared_download_file(url, filename)
+    return shared_download_file(url, filename, progress_callback=progress_callback)
 
 def query_core_shared_model_files():
     depth_variant = server_config.get("depth_anything_v2_variant", "vitl")
@@ -3537,7 +3537,7 @@ def query_global_shared_model_files():
     return shared_defs
 
 download_shared_done = False
-def download_models(model_filename = None, model_type= None, file_type = 0, submodel_no = 1, force_path = None, model_def = None):
+def download_models(model_filename = None, model_type= None, file_type = 0, submodel_no = 1, force_path = None, model_def = None, progress_callback = None):
     def computeList(filename):
         if filename == None:
             return []
@@ -3547,8 +3547,8 @@ def download_models(model_filename = None, model_type= None, file_type = 0, subm
 
 
     if file_type == 0:
-        process_files_def(**query_core_shared_model_files())
-        process_files_def(**query_matanyone_download_def(server_config))
+        process_files_def(**query_core_shared_model_files(), progress_callback=progress_callback)
+        process_files_def(**query_matanyone_download_def(server_config), progress_callback=progress_callback)
 
         global download_shared_done
         download_shared_done = True
@@ -3571,7 +3571,7 @@ def download_models(model_filename = None, model_type= None, file_type = 0, subm
             if not url.startswith("http"):
                 raise Exception(f"Model '{model_filename}' was not found locally and no URL was provided to download it. Please add an URL in the model definition file.")
             try:
-                download_file(url, local_model_filename)
+                download_file(url, local_model_filename, progress_callback=progress_callback)
             except Exception as e:
                 if os.path.isfile(local_model_filename): os.remove(local_model_filename) 
                 raise Exception(f"'{url}' is invalid for Model '{model_type}' : {str(e)}'")
@@ -3591,7 +3591,7 @@ def download_models(model_filename = None, model_type= None, file_type = 0, subm
                 if not url.startswith("http"):
                     raise Exception(f"{prop} '{filename}' was not found locally and no URL was provided to download it. Please add an URL in the model definition file.")
                 try:
-                    download_file(url, filename)
+                    download_file(url, filename, progress_callback=progress_callback)
                 except Exception as e:
                     if os.path.isfile(filename): os.remove(filename) 
                     raise Exception(f"{prop} '{url}' is invalid: {str(e)}'")
@@ -3603,7 +3603,7 @@ def download_models(model_filename = None, model_type= None, file_type = 0, subm
             if not url.startswith("http"):
                 raise Exception(f"Lora '{filename}' was not found in the Loras Folder and no URL was provided to download it. Please add an URL in the model definition file.")
             try:
-                download_file(url, filename)
+                download_file(url, filename, progress_callback=progress_callback)
             except Exception as e:
                 if os.path.isfile(filename): os.remove(filename) 
                 raise Exception(f"Lora URL '{url}' is invalid: {str(e)}'")
@@ -3612,7 +3612,7 @@ def download_models(model_filename = None, model_type= None, file_type = 0, subm
     model_files = model_type_handler.query_model_files(computeList, base_model_type, model_def)
     if not isinstance(model_files, list): model_files = [model_files]
     for one_repo in model_files:
-        process_files_def(**one_repo)
+        process_files_def(**one_repo, progress_callback=progress_callback)
 
 offload.default_verboseLevel = verbose_level
 
