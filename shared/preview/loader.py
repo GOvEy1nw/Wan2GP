@@ -59,6 +59,8 @@ def load_decoder(path: str | os.PathLike[str], spec: PreviewDecoderSpec, *, devi
             decoder_space_upscale=(True, True, True),
         )
         state_dict = load_file(str(path), device="cpu")
+        if spec.decoder_only:
+            del model.encoder
         model.load_state_dict(model.patch_tgrow_layers(state_dict), strict=True)
         model.eval().requires_grad_(False).to(device=target_device, dtype=target_dtype)
         _CACHE[cache_key] = model

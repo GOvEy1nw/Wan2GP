@@ -21,6 +21,7 @@ class PreviewDecoderSpec:
     source_url: str
     target_dir: str = "preview_decoders/taehv"
     decoder_layout: str = "NTCHW"
+    decoder_only: bool = False
 
     @property
     def relative_path(self) -> str:
@@ -63,7 +64,38 @@ TAELTX23 = PreviewDecoderSpec(
     source_url="https://raw.githubusercontent.com/madebyollin/taehv/62f7591f59dfbb4c3c02b7a621d180a9eeaba26c/safetensors/taeltx2_3.safetensors",
 )
 
-DECODERS = {TAELTX23.decoder_id: TAELTX23}
+TAEH3 = PreviewDecoderSpec(
+    decoder_id="taeh3",
+    filename="taeh3_decoder.safetensors",
+    sha256="200b17f16fbdf2afbd4f5c70b8390d57225bd2671ec17dfe162ad0e866dff66c",
+    size_bytes=39_458_084,
+    latent_channels=24,
+    patch_size=1,
+    encoder_time_downscale=(False, False, False),
+    decoder_time_upscale=(False, True, True),
+    compatible_architectures=frozenset(
+        {
+            "minimax_h3_fl2va",
+            "minimax_h3_fl2va_pruned",
+            "minimax_h3_ref2va",
+            "minimax_h3_ref2va_pruned",
+        }
+    ),
+    compatible_model_types=frozenset(
+        {
+            "minimax_h3_fl2va",
+            "minimax_h3_fl2va_pruned",
+            "minimax_h3_ref2va",
+            "minimax_h3_ref2va_pruned",
+        }
+    ),
+    adapter_id="h3",
+    source_url="https://raw.githubusercontent.com/simsim9-stack/ComfyUI-MiniMaxH3-PreviewOverride/d1eb17beb5e11856f93eb682e0998b6f232969d1/minivae/taeh3_decoder.safetensors",
+    target_dir="preview_decoders/taeh3",
+    decoder_only=True,
+)
+
+DECODERS = {spec.decoder_id: spec for spec in (TAELTX23, TAEH3)}
 
 
 def get_decoder_for_model(model_type: str, model_def: dict[str, Any] | None = None) -> PreviewDecoderSpec | None:
