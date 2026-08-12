@@ -35,7 +35,6 @@ samples/
 .DS_Store
 *DS_Store
 google/
-finetunes/
 outputs/
 outputs2/
 gradio_outputs/
