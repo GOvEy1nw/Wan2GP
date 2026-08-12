@@ -22,7 +22,7 @@ from shared.preview.adapters.ltx2 import preview_sample_count, uniform_frame_ind
 from shared.preview.coordinator import PreviewCoordinator
 from shared.preview.encoding import encode_preview
 from shared.preview.loader import PreviewDecoderError, load_decoder, validate_weight
-from shared.preview.registry import PreviewDecoderSpec, TAELTX23, decoder_capability, get_decoder_for_model
+from shared.preview.registry import PreviewDecoderSpec, TAEH3, TAELTX23, decoder_capability, get_decoder_for_model
 from shared.preview.rendering import preview_media_to_html
 from shared.preview.scheduler import CaptureScheduler
 from shared.preview.types import PreviewContext, PreviewMedia, PreviewOptions
@@ -102,6 +102,17 @@ class PreviewSubsystemTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 model_def = json.loads(Path("defaults", filename).read_text(encoding="utf-8"))["model"]
                 self.assertIsNotNone(get_decoder_for_model(filename.removesuffix(".json"), model_def))
+
+    def test_default_h3_profiles_advertise_tae_capability(self):
+        for filename in (
+            "minimax_h3_fl2va.json",
+            "minimax_h3_fl2va_pruned.json",
+            "minimax_h3_ref2va.json",
+            "minimax_h3_ref2va_pruned.json",
+        ):
+            with self.subTest(filename=filename):
+                model_def = json.loads(Path("defaults", filename).read_text(encoding="utf-8"))["model"]
+                self.assertIs(get_decoder_for_model(model_def["architecture"], model_def), TAEH3)
 
     def test_missing_weight_is_not_advertised(self):
         with patch.object(PreviewDecoderSpec, "local_path", return_value=None):
@@ -361,6 +372,32 @@ class PreviewSubsystemTests(unittest.TestCase):
         frames, _, decoded_count = decode_ltx2_latent(FakeDecoder(), latent, spec=TAELTX23, max_edge=12, preview_fps=8, source_fps=16)
         self.assertEqual(len(frames), 8)
         self.assertEqual(decoded_count, 17)
+        self.assertTrue(_torch.equal(latent, original))
+
+    @unittest.skipUnless(_torch is not None, "torch runtime unavailable")
+    def test_h3_adapter_uses_raw_latent_and_discards_warmup_frames(self):
+        from shared.preview.adapters.h3 import decode_h3_latent
+
+        class FakeDecoder:
+            def __init__(self):
+                self.parameter = _torch.nn.Parameter(_torch.zeros(1))
+
+            def parameters(self):
+                return iter((self.parameter,))
+
+            def decode_video(self, value, parallel=True, show_progress_bar=False):
+                self.received = value
+                frames = 4 * (value.shape[1] - 1) + 1
+                return _torch.zeros((1, frames, 3, 8, 12), device=value.device, dtype=value.dtype)
+
+        decoder = FakeDecoder()
+        latent = _torch.randn(24, 3, 2, 3)
+        original = latent.clone()
+        frames, _, decoded_count = decode_h3_latent(decoder, latent, spec=TAEH3, max_edge=12, preview_fps=8, source_fps=16)
+        self.assertEqual(tuple(decoder.received.shape), (1, 3, 24, 2, 3))
+        self.assertTrue(_torch.equal(decoder.received[0, :, :, :, :].permute(1, 0, 2, 3), original))
+        self.assertEqual(decoded_count, 9)
+        self.assertEqual(len(frames), 4)
         self.assertTrue(_torch.equal(latent, original))
 
     @unittest.skipUnless(_torch is not None, "torch runtime unavailable")

@@ -6,11 +6,11 @@ fallback; Off disables preview work entirely.
 
 ## Supported profiles
 
-The initial registry enables `taeltx2_3.safetensors` only for the four
-standard 22B profile IDs listed in [latent-contracts.md](latent-contracts.md).
-19B, Edit Anything, MSR, JoyAI Echo, and quantized derived profiles are not
-Tiny VAE eligible until their callback latent contracts are independently
-verified.
+The registry enables `taeltx2_3.safetensors` for the four standard 22B LTX
+profiles listed in [latent-contracts.md](latent-contracts.md), and
+`taeh3_decoder.safetensors` for the four MiniMax H3 FL2VA/Ref2VA profiles
+(including pruned variants). Other profiles remain ineligible until their
+callback latent contracts are independently verified.
 
 ## Settings and installation
 
@@ -33,6 +33,9 @@ through WanGP's existing download-progress plumbing to:
 ```text
 <configured model root>/preview_decoders/taehv/taeltx2_3.safetensors
 ```
+
+MiniMax H3 uses the same install flow at
+`preview_decoders/taeh3/taeh3_decoder.safetensors`.
 
 The file is checked by exact size and SHA-256 before it can be advertised or
 loaded. Tests never download it.
