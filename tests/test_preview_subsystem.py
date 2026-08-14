@@ -106,6 +106,10 @@ class PreviewSubsystemTests(unittest.TestCase):
                 self.assertIs(get_decoder_for_model(filename.removesuffix(".json"), model_def), TAELTX23)
 
     def test_default_h3_profiles_advertise_tae_capability(self):
+        self.assertEqual(TAEH3.filename, "taeh3.safetensors")
+        self.assertEqual(TAEH3.size_bytes, 9_791_388)
+        self.assertEqual(TAEH3.sha256, "f0f60fa072089997f817402098c2fd90777cb2660dd79cf5df42fc1e3e08e527")
+        self.assertIn("Kijai/MiniMax-H3-TAE", TAEH3.source_url)
         for filename in (
             "minimax_h3_fl2va.json",
             "minimax_h3_fl2va_pruned.json",
@@ -377,7 +381,7 @@ class PreviewSubsystemTests(unittest.TestCase):
         self.assertTrue(_torch.equal(latent, original))
 
     @unittest.skipUnless(_torch is not None, "torch runtime unavailable")
-    def test_h3_adapter_uses_raw_latent_and_discards_warmup_frames(self):
+    def test_h3_adapter_uses_raw_latent_frames(self):
         from shared.preview.adapters.h3 import decode_h3_latent
 
         class FakeDecoder:
@@ -389,8 +393,7 @@ class PreviewSubsystemTests(unittest.TestCase):
 
             def decode_video(self, value, parallel=True, show_progress_bar=False):
                 self.received = value
-                frames = 4 * (value.shape[1] - 1) + 1
-                return _torch.zeros((1, frames, 3, 8, 12), device=value.device, dtype=value.dtype)
+                return _torch.zeros((1, value.shape[1], 3, 8, 12), device=value.device, dtype=value.dtype)
 
         decoder = FakeDecoder()
         latent = _torch.randn(24, 3, 2, 3)
@@ -398,8 +401,8 @@ class PreviewSubsystemTests(unittest.TestCase):
         frames, _, decoded_count = decode_h3_latent(decoder, latent, spec=TAEH3, max_edge=12, preview_fps=8, source_fps=16)
         self.assertEqual(tuple(decoder.received.shape), (1, 3, 24, 2, 3))
         self.assertTrue(_torch.equal(decoder.received[0, :, :, :, :].permute(1, 0, 2, 3), original))
-        self.assertEqual(decoded_count, 9)
-        self.assertEqual(len(frames), 4)
+        self.assertEqual(decoded_count, 3)
+        self.assertEqual(len(frames), 2)
         self.assertTrue(_torch.equal(latent, original))
 
     @unittest.skipUnless(_torch is not None, "torch runtime unavailable")
