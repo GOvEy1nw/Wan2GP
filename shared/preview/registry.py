@@ -51,13 +51,15 @@ TAELTX23 = PreviewDecoderSpec(
     patch_size=4,
     encoder_time_downscale=(True, True, True),
     decoder_time_upscale=(True, True, True),
-    compatible_architectures=frozenset({"ltx2_22B"}),
+    compatible_architectures=frozenset({"ltx2_22B", "ltx2_25_22B"}),
     compatible_model_types=frozenset(
         {
             "ltx2_22B",
             "ltx2_22B_distilled",
             "ltx2_22B_1_1",
             "ltx2_22B_distilled_1_1",
+            "ltx2_25_22B",
+            "ltx2_25_22B_distilled",
         }
     ),
     adapter_id="ltx2",

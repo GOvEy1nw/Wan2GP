@@ -5,7 +5,7 @@ status: Human Review
 assignee:
   - '@Codex'
 created_date: '2026-08-06 16:35'
-updated_date: '2026-08-08 13:54'
+updated_date: '2026-08-14 07:04'
 labels: []
 dependencies: []
 references:
@@ -71,6 +71,7 @@ Implement the complete animated Tiny VAE live-preview feature described in WanGP
 - [x] #7 Final output bytes/content, random-number behaviour, sampler behaviour, and RGB/Off compatibility remain unchanged.
 - [x] #8 Focused tests and runtime smoke checks cover option validation, FPS-derived sampling, registry/capability filtering, missing weights, scheduling, MP4/WebP encoding, stale/cancelled previews, API compatibility, and final-output equivalence.
 - [x] #9 User/developer documentation describes global configuration, Preview FPS sampling, MP4/WebP media events, weight provenance/license, limitations, and non-goals.
+- [x] #10 LTX 2.5 Dev and Distilled defaults advertise TAE through taeltx2_3, resolve through the capability-bound registry, and retain RGB fallback for unrelated unsupported models.
 <!-- AC:END -->
 
 ## Definition of Done
@@ -95,6 +96,8 @@ Implement the complete animated Tiny VAE live-preview feature described in WanGP
 Repair LTX preview callbacks: pass each loop's post-processed denoised prediction through the existing conditioning-clear/unpatchify bridge before advancing the sampler state; add focused regression coverage for Euler, gradient-Euler, and Res2S; verify with the isolated CUDA preview suite and a fixed-seed runtime smoke.
 
 Preserve the normalized playback position of a Tiny-VAE video preview across Gradio HTML replacement using the existing renderer only; add one renderer contract assertion and visually inspect the local page where feasible.
+
+Enable taeltx2_3 for the two LTX 2.5 model IDs/architecture using the existing LTX adapter; extend the existing default-profile compatibility test; run the focused preview suite and inspect the complete diff. Live LTX 2.5 visual quality remains a manual generation check because model weights are not installed.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
@@ -181,10 +184,26 @@ Live WanGP launch was attempted in the validated environment. The runtime remain
 Fixed #0035: every LTX sampler preview callback now uses a transient post-processed denoised latent before sampler advancement (Euler, gradient Euler, and Res2S). The actual sampler state, callback metadata, and final output path are unchanged. Evidence: C:\tmp\wangp-preview-venv\Scripts\python.exe -m unittest discover -s tests -p test_preview_subsystem.py => 24 passed, 1 expected skip; targeted py_compile and git diff --check passed. Independent review verdict: ship. Remaining verification: user visual retest with the supplied LTX workload.
 
 Fixed #0036 in the renderer: MP4 previews retain their normalized playback phase across Gradio HTML replacement using browser state keyed by the HTML-escaped PreviewMedia generation ID. Invalid durations are ignored and restoration clamps below the end; image/modal behavior is untouched. Evidence: focused preview suite 24 passed with 1 expected skip; independent review verdict ship. Remaining verification: user browser retest after restarting WanGP.
+
+Enabled provisional LTX 2.5 TAE compatibility by adding ltx2_25_22B and ltx2_25_22B_distilled to TAELTX23, advertising taeltx2_3 in both LTX 2.5 defaults, and extending the existing default-profile contract test. Focused mapping/fallback tests passed (2 tests); git diff --check passed. Live LTX 2.5 visual generation remains unrun because the model assets are not installed.
+
+Independent compatibility review verdict: ship, no findings. Reviewer confirmed capability-bound model ID/architecture/decoder checks and unchanged RGB fallback. Residual risk: real LTX 2.5 latent compatibility and preview quality require a live generation test.
 <!-- SECTION:NOTES:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+author: @Codex
+created: 2026-08-14 07:00
+---
+Human review requested enabling taeltx2_3 for LTX 2.5 so the compatibility can be tested.
+---
+<!-- COMMENTS:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
 Implemented the complete Tiny VAE preview feature and the final Preview FPS transport revision. Preview preferences are global under Configuration → Previews with Off/RGB/TAE (if available), automatic TAE→RGB fallback, and TAE-only update/device/edge/FPS/WebP-fallback controls. TAE Preview FPS (16/8/4/2) derives uniformly distributed samples from actual decoded clip timing; multi-frame previews use bounded background fragmented H.264/NVENC MP4 with full-frame animated WebP and static-first-frame fallbacks. Structured WebUI/API/CLI/MCP media and legacy first-frame consumers remain compatible. Real LTX generation previously proved final-output identity and decoder performance; current focused suite passes 23 tests with 1 expected skip, compile/diff checks pass, and a 160-frame 512x288 NVENC smoke round-tripped all frames at 16 FPS/10 seconds in 308,318 bytes. Independent review found no required corrections. Remaining human-review gate is live browser validation of Configuration Apply and MP4/WebP playback.
+
+Provisional LTX 2.5 support now maps Dev and Distilled defaults to taeltx2_3 through the existing LTX adapter. Focused mapping/fallback tests passed (2 tests), git diff --check passed, and independent review returned ship with no findings. Live LTX 2.5 visual quality remains for human testing.
 <!-- SECTION:FINAL_SUMMARY:END -->
