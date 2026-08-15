@@ -5,7 +5,7 @@ status: Human Review
 assignee:
   - '@codex'
 created_date: '2026-08-12 09:00'
-updated_date: '2026-08-15 17:06'
+updated_date: '2026-08-15 17:11'
 labels: []
 dependencies: []
 modified_files:
@@ -85,6 +85,8 @@ User explicitly authorized implementing diagnosis #0040, pushing the result to `
 Implemented review fix #0040: both H3 Euler and RES retain `video_denoised = video + sigma * velocity` for preview callbacks while the sampler continues updating `video` exactly as before. Video-to-video/masked source regions are reinjected at sigma zero only on a preview clone; Spectrum anchor capture remains suppressed. The initial new test assertion exposed a scalar-versus-one-element shape mismatch and was corrected without weakening the contract.
 
 Verification 2026-08-15: targeted H3 x0 regression passed; `C:\Users\rais\Documents\GitHub\AI-Video-Studio\backend\.venv\Scripts\python.exe -m unittest tests.test_preview_subsystem` ran 27 tests, OK, 1 skipped; targeted `py_compile` passed; `git diff --check` passed with only existing CRLF conversion warnings. Independent reviewer verdict: ship. Live H3 GPU generation remains user validation.
+
+Published 2026-08-15: committed the H3 x0 callback fix to `dev` as `5e09c23e16f97bbef23ec0e4e7a87475d965b92c` and pushed `origin/dev`. Updated upstream PR #2107 by merging current `upstream/main`, applying the final H3 production/test/docs patch without Backlog artifacts, committing `eb68591963c37d8cd9bd71ab2bafd51771170341`, pushing `origin/codex/tiny-vae-live-previews`, and updating the PR title/body. PR readback confirms the new head and reports no configured checks.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -114,4 +116,9 @@ Human review feedback: MiniMax H3 TAE previews are not visually useful until the
 
 ## Remaining validation
 - A live production H3 GPU generation is still required to visually confirm early previews across representative Euler/RES and masked modes.
+
+## Publication
+- `origin/dev`: `5e09c23e16f97bbef23ec0e4e7a87475d965b92c`.
+- Upstream PR #2107 updated at `eb68591963c37d8cd9bd71ab2bafd51771170341`: https://github.com/deepbeepmeep/Wan2GP/pull/2107
+- The PR branch excludes local Backlog metadata and unrelated `dev` commits.
 <!-- SECTION:FINAL_SUMMARY:END -->
