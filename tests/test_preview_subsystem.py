@@ -464,6 +464,64 @@ class PreviewSubsystemTests(unittest.TestCase):
         self.assertTrue(_torch.equal(captured[0][1], _torch.tensor(13.0)))
         self.assertTrue(_torch.equal(final_video.latent, _torch.tensor([113.0])))
 
+    @unittest.skipUnless(_torch is not None, "torch runtime unavailable")
+    def test_h3_euler_callback_uses_denoised_latent(self):
+        source = ast.parse(Path("models/minimax_h3/pipeline.py").read_text(encoding="utf-8"))
+        denoise_pass = next(node for node in ast.walk(source) if isinstance(node, ast.FunctionDef) and node.name == "denoise_pass")
+        denoise_pass.body[0] = ast.Global(names=["video", "audio"])
+        namespace = {
+            "torch": _torch,
+            "tqdm": lambda steps, **_: steps,
+            "offload": type("Offload", (), {"set_step_no_for_lora": staticmethod(lambda *_: None)}),
+            "model_steps": 1,
+            "sigmas_video": _torch.tensor([1.0, 0.5]),
+            "sigmas_audio": _torch.tensor([1.0, 0.5]),
+            "res_coefficients": None,
+            "spectrum": None,
+            "first_block_cache": None,
+            "target_audio_condition_latents": 0,
+            "target_video_condition_frames": 0,
+            "source_latents": None,
+            "source_noise": None,
+            "source_buffer": None,
+            "editable_mask": None,
+            "denoising_start_step": 0,
+            "mask_end_step": 0,
+            "offline_spectrum": False,
+            "payload": None,
+            "context": None,
+            "audio_scale": 1.0,
+            "video": _torch.tensor([1.0]),
+            "audio": _torch.tensor([0.0]),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[denoise_pass], type_ignores=[])), "models/minimax_h3/pipeline.py", "exec"), namespace)
+
+        class Transformer:
+            cache = None
+
+            def __call__(self, *_args, **_kwargs):
+                return _torch.tensor([2.0]), _torch.tensor([0.0])
+
+        class Pipeline:
+            transformer = Transformer()
+
+            @staticmethod
+            def _set_interrupt_state():
+                pass
+
+            @staticmethod
+            def _check_abort():
+                pass
+
+        captured = []
+        namespace["self"] = Pipeline()
+        namespace["callback"] = lambda step, latent, is_final: captured.append((step, latent, is_final))
+        namespace["denoise_pass"]("H3")
+
+        self.assertEqual([(step, is_final) for step, _, is_final in captured], [(0, False)])
+        self.assertTrue(_torch.equal(captured[0][1], _torch.tensor(3.0)))
+        self.assertTrue(_torch.equal(namespace["video"], _torch.tensor([2.0])))
+
     @unittest.skipUnless(_torch is not None and _safetensors is not None and os.getenv("WANGP_PREVIEW_FIXTURE_TEST"), "opt-in torch fixture test")
     def test_strict_loader_accepts_a_matching_safetensors_fixture(self):
         from safetensors.torch import save_file
