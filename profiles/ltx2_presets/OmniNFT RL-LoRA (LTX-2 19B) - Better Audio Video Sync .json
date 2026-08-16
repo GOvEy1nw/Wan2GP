@@ -1,7 +1,8 @@
 {
-    "activated_loras": [
-        "https://huggingface.co/DeepBeepMeep/LTX-2/resolve/main/loras/omninft-ltx2-19b-rl-lora-r32.safetensors"
-    ],
-    "settings_version": 2.56,
-    "help": "OmniNFT RL-LoRA for LTX-2 19B. Improves joint audio-video generation with modality-wise reinforcement fine-tuning."
+  "profile_id": "ltx2_omninft_rl_lora_19b_better_audio_video_sync",
+  "activated_loras": [
+    "https://huggingface.co/DeepBeepMeep/LTX-2/resolve/main/loras/omninft-ltx2-19b-rl-lora-r32.safetensors"
+  ],
+  "settings_version": 2.56,
+  "help": "OmniNFT RL-LoRA for LTX-2 19B. Improves joint audio-video generation with modality-wise reinforcement fine-tuning."
 }

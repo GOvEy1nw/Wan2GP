@@ -1,0 +1,9 @@
+{
+  "profile_id": "aivs_h3_turbo_lightx2v_fl2v_4_steps_v0.1",
+  "activated_loras": [
+    "https://huggingface.co/Kijai/MiniMax-H3_comfy/resolve/main/loras/minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy_resized_avg_rank_21_bf16.safetensors"
+  ],
+  "loras_multipliers": "0.5",
+  "num_inference_steps": 6,
+  "guidance_scale": 1
+}
