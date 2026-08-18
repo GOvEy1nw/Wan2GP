@@ -20,19 +20,18 @@ def _load_variant_selection():
 
 
 class LTXUpsamplerRuntimeTests(unittest.TestCase):
-    def test_variants_load_dev_base_with_matching_distilled_and_upscaler_loras(self):
+    def test_variants_load_expected_base_with_required_upscaler_loras(self):
         runtime = _load_variant_selection()
         expected = {
             "ltx23": ("ltx2_22B", ("distilled23", "upscaler23"), (0.5, 1.0)),
-            "ltx25": ("ltx2_25_22B", ("distilled25", "upscaler25"), (1.0, 1.0)),
+            "ltx25": ("ltx2_25_22B_distilled", ("upscaler25",), (1.0,)),
         }
         model_defs = {
             "ltx2_22B": {
                 "ltx2_lora_distilled_1_1": "distilled23",
                 "ltx2_lora_pixel_spatial_upscaler": "upscaler23",
             },
-            "ltx2_25_22B": {
-                "ltx2_lora_distilled": "distilled25",
+            "ltx2_25_22B_distilled": {
                 "ltx2_lora_pixel_spatial_upscaler": "upscaler25",
             },
         }
