@@ -1,9 +1,10 @@
 {
   "profile_id": "aivs_h3_turbo_lightx2v_fl2v_4_steps_v1.0",
   "activated_loras": [
-    "https://huggingface.co/Kijai/MiniMax-H3_comfy/resolve/main/loras/minimax_h3_fl2v_lightx2v_turbo_8step_v1.0_resized_avg_rank_24_bf16.safetensors"
+    "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors"
   ],
   "loras_multipliers": "0.5",
-  "num_inference_steps": 6,
-  "guidance_scale": 1
+  "num_inference_steps": 4,
+  "guidance_scale": 1,
+  "flow_shift": 6
 }
