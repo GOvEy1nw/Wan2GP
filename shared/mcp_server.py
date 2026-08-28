@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from shared.api import SessionJob
@@ -35,9 +35,12 @@ _DOCS_DIR = Path(__file__).resolve().parents[1] / "docs"
 _DEEPY_VISUAL_TOOL_IDS = {"gen_image", "edit_image", "gen_video", "gen_video_with_speech"}
 _DEEPY_VIDEO_TOOL_IDS = {"gen_video", "gen_video_with_speech"}
 _DEEPY_AUDIO_TOOL_IDS = {"gen_song", "gen_speech_from_description", "gen_speech_from_sample"}
+_DEEPY_MODEL_DEF_STRING_LIMIT = 256
 _TOOLBOX_ACTIONS = {
+    "add_to_gallery",
     "create_color_frame",
     "inspect_media",
+    "inspect_video",
     "extract_image",
     "extract_video",
     "extract_audio",
@@ -45,13 +48,16 @@ _TOOLBOX_ACTIONS = {
     "mute_video",
     "replace_audio",
     "resize_crop",
+    "side_by_side",
     "merge_videos",
     "search_doc",
     "load_doc_section",
     "get_media_details",
 }
 _TOOLBOX_MEDIA_PARAMETERS = {
-    "inspect_media": ("media_id",),
+    "add_to_gallery": ("path", "paths"),
+    "inspect_media": ("media_id", "media_ids"),
+    "inspect_video": ("media_id",),
     "extract_image": ("media_id",),
     "extract_video": ("media_id",),
     "extract_audio": ("media_id",),
@@ -59,6 +65,7 @@ _TOOLBOX_MEDIA_PARAMETERS = {
     "mute_video": ("media_id",),
     "replace_audio": ("video_id", "audio_id"),
     "resize_crop": ("media_id",),
+    "side_by_side": ("media_ids",),
     "merge_videos": ("video_first", "video_second"),
     "get_media_details": ("media_id",),
 }
@@ -249,7 +256,7 @@ def _gallery_records(session, media_type: str = "all", limit: int = 50) -> list[
             settings = settings_list[index] if index < len(settings_list) and isinstance(settings_list[index], dict) else {}
             gallery_key = hashlib.sha1(resolved_path.replace("\\", "/").casefold().encode("utf-8")).hexdigest()[:12]
             record = {
-                "gallery_id": f"{gallery}:{gallery_key}",
+                "media_id": f"{gallery}:{gallery_key}",
                 "gallery": gallery,
                 "index": index,
                 "path": resolved_path,
@@ -263,27 +270,135 @@ def _gallery_records(session, media_type: str = "all", limit: int = 50) -> list[
             current_records.append(record)
     with _GALLERY_LOCK:
         history = _gallery_history(session)
-        for gallery_id, record in list(history.items()):
+        for media_id, record in list(history.items()):
             if not _gallery_path_exists(session, record.get("path", "")):
-                history.pop(gallery_id, None)
+                history.pop(media_id, None)
                 continue
             record.update({"index": None, "selected": False, "in_gallery": False})
             record.pop("current_time_seconds", None)
         for record in current_records:
-            history.pop(record["gallery_id"], None)
-            history[record["gallery_id"]] = copy.deepcopy(record)
+            history.pop(record["media_id"], None)
+            history[record["media_id"]] = copy.deepcopy(record)
         records = [copy.deepcopy(record) for record in history.values() if requested_type == "all" or record["media_type"] == requested_type]
     return records[-limit:]
 
 
-def _gallery_item(session, gallery_id: str) -> dict[str, Any]:
-    lookup = str(gallery_id or "").strip().lower()
+def _compact_gallery_stats(settings: dict[str, Any], media_type: str, path: str) -> dict[str, Any]:
+    def positive_number(*keys: str) -> float | None:
+        for key in keys:
+            value = settings.get(key)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                return number
+        return None
+
+    if media_type == "video":
+        from shared.utils.video_decode import probe_video_stream_metadata
+
+        metadata = probe_video_stream_metadata(path)
+        if metadata is None:
+            return {}
+        width, height = int(metadata.get("display_width", 0) or 0), int(metadata.get("display_height", 0) or 0)
+        frame_count = int(metadata.get("frame_count", 0) or 0)
+        fps = float(metadata.get("fps_float", 0) or 0)
+        duration = float(metadata.get("duration", 0) or 0)
+        if duration <= 0 and frame_count > 0 and fps > 0:
+            duration = frame_count / fps
+        stats = {}
+        if width > 0 and height > 0:
+            stats["resolution"] = f"{width}x{height}"
+        if frame_count > 0:
+            stats["frame_count"] = frame_count
+        if fps > 0:
+            stats["fps"] = int(fps) if fps.is_integer() else round(fps, 3)
+        if duration > 0:
+            stats["duration_seconds"] = int(duration) if duration.is_integer() else round(duration, 3)
+        return stats
+
+    stats = {}
+    if media_type == "image":
+        resolution = str(settings.get("resolution", "") or "").strip()
+        if not resolution:
+            width, height = positive_number("width"), positive_number("height")
+            if width is not None and height is not None:
+                resolution = f"{int(width)}x{int(height)}"
+        if resolution:
+            stats["resolution"] = resolution
+    elif media_type == "audio":
+        duration = positive_number("duration_seconds", "audio_duration")
+        if duration is not None:
+            stats["duration_seconds"] = int(duration) if duration.is_integer() else round(duration, 3)
+    return stats
+
+
+def _compact_gallery_record(record: dict[str, Any]) -> dict[str, Any]:
+    from shared.deepy.media_registry import summarize_prompt
+
+    media_id = str(record.get("media_id", "") or "").strip()
+    media_type = str(record.get("media_type", "") or "").strip()
+    settings = record.get("settings") if isinstance(record.get("settings"), dict) else {}
+    prompt = str(settings.get("prompt", "") or "").strip()
+    result = {
+        "media_id": media_id,
+        "gallery": record.get("gallery", ""),
+        "media_type": media_type,
+        "filename": Path(str(record.get("path", "") or "")).name,
+        "description": summarize_prompt(prompt, media_type),
+        "source": "Deepy" if str(settings.get("client_id", "") or "").strip().lower().startswith("ai") else "WanGP",
+        "selected": bool(record.get("selected", False)),
+        "in_gallery": bool(record.get("in_gallery", False)),
+    }
+    if record.get("current_time_seconds") is not None:
+        result["current_time_seconds"] = record["current_time_seconds"]
+    result.update(_compact_gallery_stats(settings, media_type, str(record.get("path", "") or "")))
+    return result
+
+
+def _gallery_item(session, media_id: str) -> dict[str, Any]:
+    lookup = str(media_id or "").strip().lower()
     _gallery_records(session, limit=500)
     with _GALLERY_LOCK:
         record = _gallery_history(session).get(lookup)
         if record is not None and _gallery_path_exists(session, record.get("path", "")):
             return copy.deepcopy(record)
-    raise KeyError(f"Unknown WanGP gallery_id: {gallery_id}")
+    raise KeyError(f"Unknown WanGP media_id: {media_id}")
+
+
+def _extract_media_settings(session, path: str) -> dict[str, Any]:
+    runtime = session._ensure_runtime()
+    with contextlib.chdir(runtime.root):
+        settings, _any_visual, _any_audio = runtime.module.get_settings_from_file(session._state, path, False, False, False)
+    return settings if isinstance(settings, dict) else {}
+
+
+def _media_settings(session, *, media_id: str | None = None, path: str | None = None, allow_read_file_system: bool = False, file_access_policy=None) -> dict[str, Any]:
+    media_id = str(media_id or "").strip()
+    path = str(path or "").strip()
+    if bool(media_id) == bool(path):
+        raise ValueError("Provide exactly one of media_id or path.")
+    if media_id:
+        if not _is_media_id(media_id):
+            raise ValueError("media_id must be returned by wangp_list_gallery.")
+        record = _gallery_item(session, media_id)
+        resolved_path = _resolve_existing_path(record["path"], "Gallery media")
+        settings = record.get("settings") if isinstance(record.get("settings"), dict) else {}
+        if not settings:
+            settings = _extract_media_settings(session, resolved_path)
+        return {"status": "done", "source": "gallery", "media_id": media_id, "media_type": record["media_type"], "filename": Path(resolved_path).name, "settings": _json_safe(settings)}
+    if not allow_read_file_system:
+        raise PermissionError("Direct filesystem paths are disabled for this MCP server. Use a media_id returned by wangp_list_gallery.")
+    if _is_media_id(path):
+        raise ValueError("Use media_id, not path, for Gallery media.")
+    resolved_path = str(file_access_policy.require_read(path, file=True)) if file_access_policy is not None else _resolve_existing_path(path, "media path")
+    media_type = _mcp_media_type(resolved_path)
+    if not media_type:
+        raise ValueError(f"Unsupported media file extension: {Path(resolved_path).suffix}")
+    return {"status": "done", "source": "filesystem", "media_id": "", "path": resolved_path, "media_type": media_type, "filename": Path(resolved_path).name, "settings": _json_safe(_extract_media_settings(session, resolved_path))}
 
 
 def _compact_model_metadata(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -295,11 +410,37 @@ def _compact_model_metadata(records: list[dict[str, Any]]) -> list[dict[str, Any
     return compact
 
 
-def _mcp_model_definition(model_def: dict[str, Any] | None) -> dict[str, Any] | None:
+def _compact_deepy_model_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    compact = {key: copy.deepcopy(record[key]) for key in ("model_type", "name", "family", "family_label", "base_model_type", "finetune", "main_output", "outputs", "inputs") if record.get(key) not in (None, "", [], {})}
+    compact["capabilities"] = [key for key, enabled in record.get("capabilities", {}).items() if enabled]
+    if record.get("sliding_window"):
+        compact["capabilities"].append("sliding_window")
+    compact["media_inputs"] = {kind: [key for key, enabled in values.items() if enabled] for kind, values in record.get("media_inputs", {}).items() if isinstance(values, dict) and any(values.values())}
+    return compact
+
+
+def _compact_deepy_model_schema(schema: dict[str, Any] | None) -> dict[str, Any] | None:
+    if schema is None:
+        return None
+    metadata = schema["metadata"]
+    compact = _compact_deepy_model_metadata(metadata)
+    compact.update({key: metadata[key] for key in ("description", "fps", "frames_minimum", "frames_steps", "frames_maximum") if metadata.get(key) not in (None, "")})
+    return {"metadata": compact}
+
+
+def _mcp_model_definition(model_def: dict[str, Any] | None, property_name: str | None = None, string_limit: int | None = None) -> dict[str, Any] | None:
     if model_def is None:
         return None
     result = copy.deepcopy(model_def)
     result.pop("settings", None)
+    if property_name is not None:
+        if property_name not in result:
+            raise KeyError(f"Unknown model definition property: {property_name}")
+        return {property_name: result[property_name]}
+    if string_limit is not None:
+        for key, value in result.items():
+            if isinstance(value, str) and len(value) > string_limit:
+                result[key] = f'{value[:string_limit]} [Truncated, query property "{key}" for full {len(value)} characters]'
     return result
 
 
@@ -369,6 +510,15 @@ def _strip_deepy_settings_metadata(settings: dict[str, Any]) -> dict[str, Any]:
     return stripped
 
 
+def _strip_deepy_fixed_image_mode(session, settings: dict[str, Any], model_type: str | None = None) -> dict[str, Any]:
+    stripped = dict(settings)
+    metadata = session.get_model_metadata(str(model_type or stripped.get("model_type", "") or "")) or {}
+    outputs = {str(output).casefold() for output in metadata.get("main_output", [])}
+    if "image" in outputs and "video" not in outputs and stripped.get("image_mode") != 2:
+        stripped.pop("image_mode", None)
+    return stripped
+
+
 def _relevant_deepy_general_properties(tool_id: str, general_properties: dict[str, Any]) -> dict[str, Any]:
     if tool_id in _DEEPY_VIDEO_TOOL_IDS:
         keys = ("width", "height", "num_frames", "seed")
@@ -394,7 +544,7 @@ def _deepy_template_settings(session, tool_id: str, template: str) -> dict[str, 
     effective_settings = session.prepare_settings_for_export(template_settings)
     if not general_properties["use_template_properties"]:
         effective_settings = _strip_deepy_general_property_settings(tool_id, effective_settings)
-    effective_settings = _strip_deepy_settings_metadata(effective_settings)
+    effective_settings = _strip_deepy_fixed_image_mode(session, _strip_deepy_settings_metadata(effective_settings))
     result = {
         "tool_id": tool_id,
         "template": resolved_template,
@@ -426,31 +576,42 @@ def _mcp_media_type(path: str) -> str:
     return ""
 
 
-def _is_gallery_id(value: Any) -> bool:
+def _is_media_id(value: Any) -> bool:
     return str(value or "").strip().lower().startswith(("visual:", "audio:"))
 
 
-def _resolve_mcp_media_reference(session, value: Any, label: str, allow_read_file_system: bool) -> str:
+def _resolve_mcp_media_reference(session, value: Any, label: str, allow_read_file_system: bool, file_access_policy=None) -> str:
     reference = str(value or "").strip()
     if not reference:
         raise ValueError(f"{label} is empty")
-    if _is_gallery_id(reference):
+    if _is_media_id(reference):
         path = _gallery_item(session, reference)["path"]
         return _resolve_existing_path(path, label)
     if not allow_read_file_system:
-        raise PermissionError(f"Direct filesystem paths are disabled for this MCP server. Use a Gallery id for {label}, or restart with filesystem reads enabled.")
-    return _resolve_existing_path(reference, label)
+        raise PermissionError(f"Direct filesystem paths are disabled for this MCP server. Use a media_id returned by wangp_list_gallery for {label}, or restart with filesystem reads enabled.")
+    return str(file_access_policy.require_read(reference, file=True)) if file_access_policy is not None else _resolve_existing_path(reference, label)
 
 
-def _resolve_mcp_media_value(session, value: Any, label: str, allow_read_file_system: bool) -> Any:
+def _resolve_mcp_media_input(session, media_id: str | None, path: str | None, allow_read_file_system: bool, file_access_policy=None) -> str:
+    media_id, path = str(media_id or "").strip(), str(path or "").strip()
+    if bool(media_id) == bool(path):
+        raise ValueError("Provide exactly one of media_id or path.")
+    if media_id and not _is_media_id(media_id):
+        raise ValueError("media_id must be returned by wangp_list_gallery.")
+    if path and _is_media_id(path):
+        raise ValueError("Use media_id, not path, for Gallery media.")
+    return _resolve_mcp_media_reference(session, media_id or path, "media_id" if media_id else "path", allow_read_file_system, file_access_policy)
+
+
+def _resolve_mcp_media_value(session, value: Any, label: str, allow_read_file_system: bool, file_access_policy=None) -> Any:
     if value is None or isinstance(value, str) and not value.strip():
         return value
     if isinstance(value, (list, tuple)):
-        return [_resolve_mcp_media_reference(session, item, label, allow_read_file_system) for item in value]
-    return _resolve_mcp_media_reference(session, value, label, allow_read_file_system)
+        return [_resolve_mcp_media_reference(session, item, label, allow_read_file_system, file_access_policy) for item in value]
+    return _resolve_mcp_media_reference(session, value, label, allow_read_file_system, file_access_policy)
 
 
-def _resolve_generation_media(session, source: dict[str, Any] | list[dict[str, Any]], allow_read_file_system: bool):
+def _resolve_generation_media(session, source: dict[str, Any] | list[dict[str, Any]], allow_read_file_system: bool, file_access_policy=None):
     resolved = copy.deepcopy(source)
 
     def resolve_task(task: dict[str, Any]) -> None:
@@ -462,13 +623,19 @@ def _resolve_generation_media(session, source: dict[str, Any] | list[dict[str, A
             return
         settings = task.get("params") if isinstance(task.get("params"), dict) else task.get("settings") if isinstance(task.get("settings"), dict) else task
         for key in _MCP_MEDIA_SETTING_KEYS & settings.keys():
-            settings[key] = _resolve_mcp_media_value(session, settings[key], key, allow_read_file_system)
+            settings[key] = _resolve_mcp_media_value(session, settings[key], key, allow_read_file_system, file_access_policy)
         if not allow_read_file_system:
             for lora in settings.get("activated_loras", []) or []:
                 lora_text = str(lora or "").strip()
                 lora_path = Path(lora_text)
                 if lora_path.is_absolute() or ".." in lora_text.replace("\\", "/").split("/") or lora_text.lower().startswith("file:"):
                     raise PermissionError("Direct filesystem paths are disabled for activated_loras. Use identifiers returned by wangp_list_loras.")
+        elif file_access_policy is not None:
+            for lora in settings.get("activated_loras", []) or []:
+                lora_text = str(lora or "").strip()
+                lora_path = Path(lora_text)
+                if lora_path.is_absolute() or ".." in lora_text.replace("\\", "/").split("/") or lora_text.lower().startswith("file:"):
+                    file_access_policy.require_read(lora_text.removeprefix("file:"), file=True)
 
     if isinstance(resolved, list):
         for task in resolved:
@@ -554,20 +721,20 @@ class _MediaTransferStore:
             self._cleanup()
             return self._uploads.pop(str(token or ""), None)
 
-    def create_download(self, gallery_id: str) -> dict[str, Any]:
-        record = _gallery_item(self.session, gallery_id)
+    def create_download(self, media_id: str) -> dict[str, Any]:
+        record = _gallery_item(self.session, media_id)
         path = _resolve_existing_path(record["path"], "Gallery media")
         token = uuid.uuid4().hex
         with self._lock:
             self._cleanup()
-            self._downloads[token] = {"created": time.time(), "gallery_id": record["gallery_id"]}
-        return {"gallery_id": record["gallery_id"], "download_url": f"/wangp_api/gallery/download/{token}", "filename": Path(path).name, "media_type": record["media_type"], "size": Path(path).stat().st_size, "expires_in_seconds": _MEDIA_TRANSFER_TTL_SECONDS}
+            self._downloads[token] = {"created": time.time(), "media_id": record["media_id"]}
+        return {"media_id": record["media_id"], "download_url": f"/wangp_api/gallery/download/{token}", "filename": Path(path).name, "media_type": record["media_type"], "size": Path(path).stat().st_size, "expires_in_seconds": _MEDIA_TRANSFER_TTL_SECONDS}
 
     def consume_download(self, token: str) -> dict[str, Any] | None:
         with self._lock:
             self._cleanup()
             transfer = self._downloads.pop(str(token or ""), None)
-        return None if transfer is None else _gallery_item(self.session, transfer["gallery_id"])
+        return None if transfer is None else _gallery_item(self.session, transfer["media_id"])
 
     def upload_path(self, filename: str) -> Path:
         root = Path(self.session._output_dir) if self.session._output_dir is not None else self.session._root / "outputs"
@@ -576,18 +743,20 @@ class _MediaTransferStore:
         return upload_root / Path(filename).name
 
 
-def _mcp_postprocessing_processes(media_type: str, allow_read_file_system: bool = False) -> list[dict[str, Any]]:
+def _mcp_postprocessing_processes(media_type: str, allow_read_file_system: bool = False, processes: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     from postprocessing import catalog as postprocessing_catalog
 
-    processes = copy.deepcopy(postprocessing_catalog.query_processes(media_type))
+    processes = postprocessing_catalog.call_processes(postprocessing_catalog.query_processes(media_type) if processes is None else processes)
     for process in processes:
         for parameter in process.get("parameters", ()):
             original_name = str(parameter.get("name", "") or "")
             replacement = _POSTPROCESS_PATH_PARAMETERS.get(original_name)
             if replacement is None:
+                if parameter.get("media_type") == "image":
+                    parameter["description"] = str(parameter.get("description", "") or "").rstrip() + (" Values may be Gallery media IDs or authorized existing image paths." if allow_read_file_system else " Values must be Gallery media IDs returned by wangp_list_gallery.")
                 continue
             parameter["name"] = replacement
-            parameter["description"] = "Gallery id for the required audio file" + (" or an existing server filesystem path." if allow_read_file_system else ". Direct filesystem paths are disabled for this server.")
+            parameter["description"] = "Media ID for the required audio file" + (" or an authorized existing server path." if allow_read_file_system else ". Direct filesystem paths are disabled for this server.")
     return processes
 
 
@@ -627,12 +796,17 @@ def _build_mcp_postprocessing_task(source_path: str, process: dict[str, Any], pa
         task.update({"mode": "edit_remux", "video_source": source_path, "postprocess_audio": process_id})
     elif process_type == postprocessing_catalog.PROCESS_TYPE_AUDIO_EDIT:
         task.update({"mode": "edit_audio", "audio_source": source_path, "postprocess_audio": process_id})
+    parameter_defs = {str(parameter["name"]): parameter for parameter in process.get("parameters", ())}
+    spatial_parameter_names = set()
+    if process_type == postprocessing_catalog.PROCESS_TYPE_SPATIAL_UPSAMPLING:
+        spatial_parameters = {name: value for name, value in parameters.items() if name != "multiplier"}
+        spatial_parameter_names.update(spatial_parameters)
+        task.update(spatial_parameters)
     path_task_keys = {"audio_path": "audio_source", "voice_sample_path": "replace_voice_sample", "voice_sample2_path": "replace_voice_sample2"}
     for parameter_name, task_key in path_task_keys.items():
         if parameter_name in parameters:
             task[task_key] = _resolve_existing_path(parameters[parameter_name], parameter_name)
-    standard_parameters = {"multiplier", "seed", "prompt", "negative_prompt", *path_task_keys}
-    parameter_defs = {str(parameter["name"]): parameter for parameter in process.get("parameters", ())}
+    standard_parameters = {"multiplier", "seed", "prompt", "negative_prompt", *path_task_keys, *spatial_parameter_names}
     for name, value in parameters.items():
         if name not in standard_parameters:
             task[str(parameter_defs[name].get("setting", name))] = value
@@ -660,26 +834,59 @@ def _toolbox_discovery(toolbox, allow_read_file_system: bool = False) -> list[di
         for parameter_name in _TOOLBOX_MEDIA_PARAMETERS.get(name, ()):
             parameter = function.get("parameters", {}).get("properties", {}).get(parameter_name)
             if isinstance(parameter, dict):
-                parameter["description"] = "A WanGP Gallery id" + (" or an existing server filesystem path." if allow_read_file_system else ". Direct filesystem paths are disabled for this server.")
+                plural = parameter.get("type") == "array"
+                maximum = int(parameter.get("maxItems", 0) or 0)
+                plural_description = f"One to {maximum} media IDs returned by wangp_list_gallery" if maximum > 0 else "Media IDs returned by wangp_list_gallery"
+                parameter["description"] = f"{plural_description if plural else 'A media ID returned by wangp_list_gallery'}" + (" or authorized existing server paths." if allow_read_file_system and plural else " or an authorized existing server path." if allow_read_file_system else ". Direct filesystem paths are disabled for this server.")
+        if name == "inspect_media":
+            nested_media_id = function.get("parameters", {}).get("properties", {}).get("media_inputs", {}).get("items", {}).get("properties", {}).get("media_id")
+            if isinstance(nested_media_id, dict):
+                nested_media_id["description"] = "A media ID returned by wangp_list_gallery or an authorized existing server path." if allow_read_file_system else "A media ID returned by wangp_list_gallery. Direct filesystem paths are disabled for this server."
         actions.append(function)
     return sorted(actions, key=lambda action: str(action.get("name", "")))
 
 
-def _resolve_toolbox_arguments(session, toolbox, action: str, arguments: dict[str, Any], allow_read_file_system: bool = False) -> dict[str, Any]:
+def _resolve_toolbox_arguments(session, toolbox, action: str, arguments: dict[str, Any], allow_read_file_system: bool = False, file_access_policy=None) -> dict[str, Any]:
     from shared.deepy import media_registry
 
     resolved = dict(arguments or {})
-    for parameter_name in _TOOLBOX_MEDIA_PARAMETERS.get(action, ()):
-        value = str(resolved.get(parameter_name, "") or "").strip()
-        if not value:
-            continue
-        if media_registry.get_media_record(toolbox.session, value) is not None:
-            continue
-        media_path = _resolve_mcp_media_reference(session, value, parameter_name, allow_read_file_system)
-        record = media_registry.register_media(toolbox.session, media_path, source="gallery" if _is_gallery_id(value) else "filesystem")
+
+    def resolve_media_id(value: Any, parameter_name: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{parameter_name} must be a string.")
+        value = value.strip()
+        if not value or media_registry.get_media_record(toolbox.session, value) is not None:
+            return value
+        media_path = _resolve_mcp_media_reference(session, value, parameter_name, allow_read_file_system, file_access_policy)
+        record = media_registry.register_media(toolbox.session, media_path, source="gallery" if _is_media_id(value) else "filesystem")
         if record is None:
             raise ValueError(f"Unsupported media file: {media_path}")
-        resolved[parameter_name] = record["media_id"]
+        return record["media_id"]
+
+    for parameter_name in _TOOLBOX_MEDIA_PARAMETERS.get(action, ()):
+        raw_value = resolved.get(parameter_name, None)
+        if raw_value is None:
+            continue
+        if parameter_name in {"media_ids", "paths"} and not isinstance(raw_value, list):
+            raise ValueError(f"{parameter_name} must be an array.")
+        values = raw_value if isinstance(raw_value, list) else [raw_value]
+        resolved_values = []
+        for index, raw_item in enumerate(values):
+            item_parameter_name = f"{parameter_name}[{index}]" if isinstance(raw_value, list) else parameter_name
+            resolved_values.append(resolve_media_id(raw_item, item_parameter_name))
+        resolved[parameter_name] = resolved_values if isinstance(raw_value, list) else resolved_values[0]
+    if action == "inspect_media" and resolved.get("media_inputs") is not None:
+        raw_inputs = resolved["media_inputs"]
+        if not isinstance(raw_inputs, list):
+            raise ValueError("media_inputs must be an array.")
+        resolved_inputs = []
+        for index, raw_input in enumerate(raw_inputs):
+            if not isinstance(raw_input, dict):
+                raise ValueError(f"media_inputs[{index}] must be an object.")
+            resolved_input = dict(raw_input)
+            resolved_input["media_id"] = resolve_media_id(resolved_input.get("media_id"), f"media_inputs[{index}].media_id")
+            resolved_inputs.append(resolved_input)
+        resolved["media_inputs"] = resolved_inputs
     return resolved
 
 
@@ -691,11 +898,74 @@ def _register_toolbox_result_media(session, result: Any) -> Any:
         output_paths.append(result["output_file"])
     if isinstance(result.get("output_files"), list):
         output_paths.extend(path for path in result["output_files"] if isinstance(path, str) and path.strip())
+    if isinstance(result.get("paths"), list):
+        output_paths.extend(path for path in result["paths"] if isinstance(path, str) and path.strip())
     gallery_items = [_register_gallery_media(session, path) for path in output_paths if Path(path).is_file() and _mcp_media_type(path)]
     if gallery_items:
         result = dict(result)
         result["gallery_items"] = gallery_items
     return result
+
+
+def _resolve_io_source(session, file_access_policy, value: Any, *, file: bool = False) -> tuple[str, bool]:
+    source = str(value or "").strip()
+    if not source:
+        raise ValueError("source is empty.")
+    if _is_media_id(source):
+        path = Path(_gallery_item(session, source)["path"]).expanduser().resolve()
+        if file and not path.is_file() or not file and not path.exists():
+            raise FileNotFoundError(f"Gallery media does not exist: {path}")
+        return str(path), True
+    return str(file_access_policy.require_read(source, file=file)), False
+
+
+def _run_io_action(session, file_access_policy, action: str, arguments: dict[str, Any], downloads_enabled: bool) -> dict[str, Any]:
+    from shared.deepy import filesystem
+
+    definition = filesystem.IO_ACTIONS[action]
+    for parameter in definition["parameters"].get("required", []):
+        if parameter not in arguments or arguments[parameter] is None:
+            raise ValueError(f"{parameter} is required.")
+    if action == "list":
+        return file_access_policy.virtualize_result(filesystem.list_entries(file_access_policy, path=arguments.get("path", ""), pattern=arguments.get("pattern", "*"), recursive=arguments.get("recursive", False), limit=arguments.get("limit", 200), offset=arguments.get("offset", 0)))
+    if action == "info":
+        path, _gallery = _resolve_io_source(session, file_access_policy, arguments["source"])
+        return file_access_policy.virtualize_result(filesystem.file_info(path))
+    if action == "read_text":
+        return file_access_policy.virtualize_result(filesystem.read_text(file_access_policy, arguments["path"], start_line=arguments.get("start_line", 1), end_line=arguments.get("end_line"), encoding=arguments.get("encoding", "utf-8-sig")))
+    if action == "search_text":
+        return file_access_policy.virtualize_result(filesystem.search_text(file_access_policy, arguments["path"], arguments["query"], pattern=arguments.get("pattern", "*"), recursive=arguments.get("recursive", False), regex=arguments.get("regex", False), case_sensitive=arguments.get("case_sensitive", False), limit=arguments.get("limit", 100)))
+    if action == "write_text":
+        return file_access_policy.virtualize_result(filesystem.write_text(file_access_policy, arguments["path"], arguments["text"], mode=arguments.get("mode", "create"), encoding=arguments.get("encoding", "utf-8")))
+    if action == "mkdir":
+        return file_access_policy.virtualize_result(filesystem.make_directory(file_access_policy, arguments["path"]))
+    if action == "copy":
+        source, gallery = _resolve_io_source(session, file_access_policy, arguments["source"], file=True)
+        return file_access_policy.virtualize_result(filesystem.copy_file(file_access_policy, source, arguments["destination"], overwrite=arguments.get("overwrite", False), source_authorized=True))
+    if action == "move":
+        return file_access_policy.virtualize_result(filesystem.move_path(file_access_policy, arguments["source"], arguments["destination"]))
+    if action == "delete":
+        return file_access_policy.virtualize_result(filesystem.delete_path(file_access_policy, arguments["path"], recursive=arguments.get("recursive", False)))
+    if action == "zip":
+        raw_sources = arguments["sources"]
+        if not isinstance(raw_sources, list) or not raw_sources:
+            raise ValueError("sources must be a non-empty array.")
+        sources = []
+        for source in raw_sources:
+            path, _gallery = _resolve_io_source(session, file_access_policy, source)
+            sources.append(path)
+        result = filesystem.zip_files(file_access_policy, sources, destination=arguments.get("destination", ""), authorized_sources=set(sources))
+        if downloads_enabled:
+            from shared.gradio.downloads import register_file_download
+            result["download"] = register_file_download(result["output_file"], "application/zip")
+        return file_access_policy.virtualize_result(result)
+    if action == "download":
+        if not downloads_enabled:
+            raise RuntimeError("Direct WanGP downloads are unavailable for this MCP transport.")
+        path, _gallery = _resolve_io_source(session, file_access_policy, arguments["source"], file=True)
+        from shared.gradio.downloads import register_file_download
+        return file_access_policy.virtualize_result({"status": "done", "path": path, "filename": Path(path).name, "size_bytes": Path(path).stat().st_size, "download": register_file_download(path), "error": ""})
+    raise ValueError(f"Unknown IO action: {action}")
 
 
 class _JobRecord:
@@ -746,7 +1016,7 @@ class _JobRecord:
             updated_at = self.updated_at
         if isinstance(result, dict):
             generated_paths = {str(path).replace("\\", "/").casefold() for path in result.get("generated_files", [])}
-            result["gallery_items"] = [record for record in _gallery_records(self.session, limit=500) if record["path"].replace("\\", "/").casefold() in generated_paths]
+            result["gallery_items"] = [_compact_gallery_record(record) for record in _gallery_records(self.session, limit=500) if record["path"].replace("\\", "/").casefold() in generated_paths]
         return {
             "job_id": self.job_id,
             "done": self.job.done,
@@ -791,7 +1061,7 @@ def _config_file_from_arg(value: str | None) -> str | None:
     return str(path)
 
 
-def build_server_for_session(session, settings: dict[str, Any] | None = None, toolbox=None, default_job_event_limit: int = 20, allow_read_file_system: bool = False, http_media_transfer: bool = False):
+def build_server_for_session(session, settings: dict[str, Any] | None = None, toolbox=None, default_job_event_limit: int = 20, allow_read_file_system: bool = False, http_media_transfer: bool = False, compact_model_tools: bool = False, file_access_policy=None, io_downloads: bool = False):
     try:
         from mcp.server.fastmcp import FastMCP
     except Exception as exc:
@@ -801,7 +1071,10 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
     mcp = FastMCP("WanGP", **dict(settings or {}))
     _register_documentation_resources(mcp)
     default_job_event_limit = max(0, min(int(default_job_event_limit), _MAX_STORED_EVENTS))
-    allow_read_file_system = bool(allow_read_file_system)
+    if file_access_policy is None:
+        from shared.deepy.filesystem import build_file_access_policy
+        file_access_policy = build_file_access_policy({}, unrestricted_read=bool(allow_read_file_system))
+    allow_read_file_system = file_access_policy.read_enabled
     transfer_store = _MediaTransferStore(session) if http_media_transfer else None
     toolbox_instance = toolbox
 
@@ -838,7 +1111,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 except OSError:
                     pass
                 return JSONResponse({"error": str(exc)}, status_code=413 if size > _MAX_UPLOAD_BYTES else 400)
-            return JSONResponse({"status": "uploaded", "size": size, **record})
+            return JSONResponse({"status": "uploaded", "size": size, **_compact_gallery_record(record)})
 
         @mcp.custom_route("/wangp_api/gallery/download/{token}", methods=["GET"], include_in_schema=False)
         async def download_gallery_media(request):
@@ -860,13 +1133,47 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
     def wangp_agent_prompt() -> str:
         return _AGENT_GUIDE_PATH.read_text(encoding="utf-8")
 
+    def legacy_model_tool(function):
+        return function if compact_model_tools else mcp.tool()(function)
+
     @mcp.tool()
+    def wangp_models(query: str = "", filters: dict[str, Any] | None = None, limit: int = 10, offset: int = 0) -> dict[str, Any]:
+        """Search compact models; filters accepts family, base_model_type, finetune, model_type, main_output, inputs, or name."""
+
+        filters = dict(filters or {})
+        allowed = {"family", "base_model_type", "finetune", "model_type", "main_output", "inputs", "name"}
+        unknown = sorted(set(filters) - allowed)
+        if unknown:
+            raise ValueError(f"Unknown model filter: {unknown[0]}")
+        filters["query"] = str(query or "").strip() or None
+        matches = session.list_model_metadata(**filters)
+        offset, limit = max(0, int(offset)), max(1, min(int(limit), 50))
+        page = [_compact_deepy_model_metadata(record) for record in matches[offset:offset + limit]]
+        return {"models": page, "total": len(matches), "returned": len(page), "offset": offset, "has_more": offset + len(page) < len(matches)}
+
+    @mcp.tool()
+    def wangp_model(model_type: str, view: Literal["schema", "definition", "defaults"] = "schema", property: str | None = None) -> dict[str, Any]:
+        """Return one model's compact schema, definition, or generation defaults. Compact servers preview root strings longer than 256 characters; repeat view='definition' with the property named in the suffix to retrieve its full value."""
+
+        if property is not None and view != "definition":
+            raise ValueError("property is supported only with view='definition'")
+        if view == "definition":
+            result = _mcp_model_definition(session.get_model_def(model_type), property_name=property, string_limit=_DEEPY_MODEL_DEF_STRING_LIMIT if compact_model_tools else None)
+        elif view == "defaults":
+            result = _strip_deepy_fixed_image_mode(session, _strip_deepy_settings_metadata(session.get_exported_default_settings(model_type)), model_type)
+        else:
+            result = _compact_deepy_model_schema(session.get_model_schema(model_type))
+        if result is None:
+            raise KeyError(f"Unknown model_type: {model_type}")
+        return result
+
+    @legacy_model_tool
     def wangp_list_models(family: str | None = None, base_model_type: str | None = None, finetune: str | None = None, model_type: str | None = None, main_output: str | None = None, inputs: str | None = None, name: str | None = None, query: str | None = None, limit: int = 10, offset: int = 0, include_availability: bool = False) -> list[dict[str, Any]]:
         """List at most 10 compact model records. All string filters accept case-insensitive * and ? globs; query searches names, ids, families, and descriptions. For generation without a user-specified model, use the corresponding default template instead of browsing."""
 
         return _compact_model_metadata(session.list_model_metadata(family=family, base_model_type=base_model_type, finetune=finetune, model_type=model_type, main_output=main_output, inputs=inputs, name=name, query=query, limit=max(1, min(int(limit), 10)), offset=max(0, int(offset)), include_availability=include_availability))
 
-    @mcp.tool()
+    @legacy_model_tool
     def wangp_search_models(query: str, family: str | None = None, base_model_type: str | None = None, finetune: str | None = None, main_output: str | None = None, inputs: str | None = None, limit: int = 10, offset: int = 0, include_availability: bool = False) -> dict[str, Any]:
         """Search models by user-facing name, model id, architecture, family, or description and return a bounded page with totals. Other string filters accept * and ? globs."""
 
@@ -878,88 +1185,107 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         page = _compact_model_metadata(matches[offset:offset + limit])
         return {"matches": page, "total_matches": len(matches), "returned": len(page), "offset": offset, "has_more": offset + len(page) < len(matches)}
 
-    @mcp.tool()
+    @legacy_model_tool
     def wangp_list_model_defs(family: str | None = None, base_model_type: str | None = None, finetune: str | None = None, model_type: str | None = None, main_output: str | None = None, inputs: str | None = None, name: str | None = None, query: str | None = None, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
         """List a bounded page of full WanGP model definitions. String filters accept * and ? globs. Prefer search, then fetch one selected model."""
 
         return session.list_model_defs(family=family, base_model_type=base_model_type, finetune=finetune, model_type=model_type, main_output=main_output, inputs=inputs, name=name, query=query, limit=max(1, min(int(limit), 20)), offset=max(0, int(offset)))
 
-    @mcp.tool()
+    @legacy_model_tool
     def wangp_get_model(model_type: str) -> dict[str, Any] | None:
         """Return one WanGP model definition with parameter declarations and capabilities. Embedded default values are omitted. Do not call this after a template query unless a required parameter remains absent from both template settings and the compact schema."""
 
         return _mcp_model_definition(session.get_model_def(model_type))
 
-    @mcp.tool()
+    @legacy_model_tool
     def wangp_get_model_metadata(model_type: str, include_availability: bool = False) -> dict[str, Any] | None:
         """Return one compact model metadata record."""
 
         return session.get_model_metadata(model_type, include_availability=include_availability)
 
-    @mcp.tool()
+    @legacy_model_tool
     def wangp_get_model_availability(model_type: str) -> dict[str, Any]:
         """Return local file availability for one model using the same status as the UI model selector."""
 
         return session.get_model_availability(model_type)
 
-    @mcp.tool()
+    @legacy_model_tool
     def wangp_list_model_availability(family: str | None = None, base_model_type: str | None = None, finetune: str | None = None, model_type: str | None = None, main_output: str | None = None, inputs: str | None = None, name: str | None = None, query: str | None = None, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         """List a bounded page of local model-file availability records using the model discovery filters."""
 
         return session.list_model_availability(family=family, base_model_type=base_model_type, finetune=finetune, model_type=model_type, main_output=main_output, inputs=inputs, name=name, query=query, limit=max(1, min(int(limit), 50)), offset=max(0, int(offset)))
 
-    @mcp.tool()
+    @legacy_model_tool
     def wangp_get_default_settings(model_type: str) -> dict[str, Any]:
         """Return pristine model defaults generated from WanGP and the model handler, filtered to relevant fields and without fixed metadata such as type or settings version. User-saved UI defaults are not included. Do not call this after a template query because template settings already include these model defaults."""
 
-        return _strip_deepy_settings_metadata(session.get_exported_default_settings(model_type))
+        return _strip_deepy_fixed_image_mode(session, _strip_deepy_settings_metadata(session.get_exported_default_settings(model_type)), model_type)
 
     @mcp.tool()
-    def wangp_list_loras(model_type: str) -> dict[str, Any]:
-        """List every locally available LoRA for a model. Returned identifiers can be copied directly into activated_loras and paired with loras_multipliers."""
+    def wangp_model_settings(model_type: str, setting_id: str | None = None) -> dict[str, Any]:
+        """List saved settings, accelerator profiles and presets for a model, or return one by id."""
 
-        return session.list_loras(model_type)
+        result = session.get_model_settings(model_type, setting_id)
+        if setting_id is not None and isinstance(result.get("content"), dict):
+            result["content"] = _strip_deepy_fixed_image_mode(session, result["content"], model_type)
+        return result
 
     @mcp.tool()
+    def wangp_list_loras(model_type: str, name: str | None = None) -> dict[str, Any]:
+        """Recursively list locally available LoRAs for a model. Optional name accepts a case-insensitive * and ? glob over each subfolder-relative identifier. Returned identifiers can be copied directly into activated_loras and paired with loras_multipliers."""
+
+        return session.list_loras(model_type, name=name)
+
+    @legacy_model_tool
     def wangp_get_model_schema(model_type: str) -> dict[str, Any] | None:
         """Return a compact capability and usage summary for one model. After a template query, call this only to verify a required capability or limit that the template does not establish. Use wangp_get_default_settings only for raw non-template generation requests."""
 
         return session.get_model_schema(model_type)
 
     @mcp.tool()
-    def wangp_list_gallery(media_type: str = "all", limit: int = 50) -> list[dict[str, Any]]:
-        """List current and remembered session Gallery media, including paths, settings, ids, selection state, and whether each item is still displayed in the UI."""
+    def wangp_list_gallery(media_type: str = "all", limit: int = 50, selected_only: bool = False) -> list[dict[str, Any]]:
+        """List compact summaries of current and remembered session Gallery media, including actual video resolution, frame count, FPS, and duration from WanGP's cached media probe. Set selected_only to return only live UI selections. Use media_id with wangp_get_media_settings only when full generation settings are needed."""
 
-        return _gallery_records(session, media_type=media_type, limit=limit)
-
-    @mcp.tool()
-    def wangp_get_gallery_item(gallery_id: str) -> dict[str, Any]:
-        """Return one current or remembered session Gallery item by the gallery_id returned from wangp_list_gallery."""
-
-        return _gallery_item(session, gallery_id)
+        records = _gallery_records(session, media_type=media_type, limit=500 if selected_only else limit)
+        if selected_only:
+            records = [record for record in records if record["selected"]]
+        return [_compact_gallery_record(record) for record in records[-max(1, min(int(limit), 500)):]]
 
     @mcp.tool()
-    def wangp_get_gallery_selection(media_type: str = "all") -> list[dict[str, Any]]:
-        """Return the currently selected visual and/or audio WanGP Gallery items."""
+    def wangp_get_media_settings(media_id: str | None = None, path: str | None = None) -> dict[str, Any]:
+        """Return generation settings for one media file. Provide exactly one input: media_id for Gallery media, or path for a server file when filesystem reads are enabled."""
 
-        return [record for record in _gallery_records(session, media_type=media_type, limit=500) if record["selected"]]
+        return _media_settings(session, media_id=media_id, path=path, allow_read_file_system=allow_read_file_system, file_access_policy=file_access_policy)
 
-    if allow_read_file_system:
-        @mcp.tool()
-        def wangp_list_files(path: str, extensions: list[str] | str | None = None) -> dict[str, Any]:
-            """List files directly inside a server directory, optionally filtered by extensions. Returns names, extensions, paths, and byte sizes."""
+    @mcp.tool()
+    def wangp_io(action: str | None = None, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Discover or run filesystem utilities. Use @alias/path; plain paths use video outputs. Omit action for actions; pass action alone for its schema."""
 
-            from shared.deepy import filesystem
+        from shared.deepy.filesystem import available_io_actions
 
-            return filesystem.list_files(path, extensions)
+        action_name = str(action or "").strip()
+        actions = available_io_actions(file_access_policy, downloads_enabled=io_downloads)
+        if not action_name:
+            compact = [{"name": candidate["name"], "description": candidate["description"]} for candidate in actions]
+            roots = [root["path"] for root in file_access_policy.roots()] if file_access_policy.read_enabled else []
+            return {"status": "discovery", "actions": compact, "count": len(compact), **({"roots": roots} if roots else {}), **({"read_everywhere": True} if file_access_policy.read_everywhere else {}), "next": "Call again with one action and omit arguments for its schema."}
+        action_defs = [candidate for candidate in actions if candidate["name"] == action_name]
+        if not action_defs:
+            raise ValueError(f"IO action '{action_name}' is unavailable. Call without action to list allowed actions.")
+        if arguments is None:
+            return {"status": "schema", "action": action_defs[0]}
+        return _run_io_action(session, file_access_policy, action_name, dict(arguments), io_downloads)
 
-        @mcp.tool()
-        def wangp_query_file(path: str) -> dict[str, Any]:
-            """Inspect a Gallery id or server file path. Returns useful media metadata, or UTF-8 text up to 16,000 characters."""
+    @mcp.tool()
+    def wangp_notify(message: str, title: str = "Deepy notification") -> dict[str, Any]:
+        """Send a message through WanGP's configured notification destinations."""
 
-            from shared.deepy import filesystem
+        from shared.notifications import send_notification
 
-            return filesystem.query_file(_resolve_mcp_media_reference(session, path, "path", True))
+        message = str(message or "").strip()
+        if not message:
+            raise ValueError("message is required")
+        return send_notification(session._ensure_runtime().module.server_config, str(title or "Deepy notification").strip(), message)
 
     if transfer_store is not None:
         @mcp.tool()
@@ -969,10 +1295,10 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
             return transfer_store.create_upload(filename)
 
         @mcp.tool()
-        def wangp_create_gallery_download(gallery_id: str) -> dict[str, Any]:
+        def wangp_create_gallery_download(media_id: str) -> dict[str, Any]:
             """Create a short-lived HTTP GET URL for downloading one Gallery item. Only registered Gallery media can be downloaded."""
 
-            return transfer_store.create_download(gallery_id)
+            return transfer_store.create_download(media_id)
 
     @mcp.tool()
     def wangp_list_deepy_templates(tool_id: str | None = None) -> list[dict[str, Any]]:
@@ -987,19 +1313,20 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         return _deepy_template_settings(session, tool_id, template)
 
     @mcp.tool()
-    def wangp_postprocess(path: str, process: str | None = None, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Discover or run compatible post-processing for a Gallery id. Direct server paths are accepted only when filesystem reads were enabled at startup. Omit process for discovery."""
+    def wangp_postprocess(media_id: str | None = None, path: str | None = None, process: str | None = None, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Discover or run compatible post-processing. Provide exactly one input: media_id for Gallery media, or path for a server file when filesystem reads are enabled. Omit process for discovery."""
 
         from postprocessing import catalog as postprocessing_catalog
 
-        source_path = _resolve_mcp_media_reference(session, path, "path", allow_read_file_system)
+        source_path = _resolve_mcp_media_input(session, media_id, path, allow_read_file_system, file_access_policy)
         media_type = _mcp_media_type(source_path)
         if not media_type:
             raise ValueError(f"Unsupported media file extension: {Path(source_path).suffix}")
-        processes = _mcp_postprocessing_processes(media_type, allow_read_file_system)
+        processes = postprocessing_catalog.query_processes(media_type)
+        discovered_processes = _mcp_postprocessing_processes(media_type, allow_read_file_system, processes)
         process_id = str(process or "").strip()
         if not process_id:
-            return {"status": "discovery", "path": source_path, "media_type": media_type, "processes": processes, "count": len(processes)}
+            return {"status": "discovery", "path": source_path, "media_type": media_type, "processes": discovered_processes, "count": len(discovered_processes)}
         matches = [candidate for candidate in processes if candidate["id"] == process_id]
         if len(matches) != 1:
             raise ValueError(f"Post-processing process '{process_id}' is {'not available' if not matches else 'ambiguous'} for {media_type}.")
@@ -1008,7 +1335,11 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         if error:
             raise ValueError(error)
         for parameter_name in set(_POSTPROCESS_PATH_PARAMETERS.values()) & normalized_parameters.keys():
-            normalized_parameters[parameter_name] = _resolve_mcp_media_reference(session, normalized_parameters[parameter_name], parameter_name, allow_read_file_system)
+            normalized_parameters[parameter_name] = _resolve_mcp_media_reference(session, normalized_parameters[parameter_name], parameter_name, allow_read_file_system, file_access_policy)
+        for parameter_def in process_def.get("parameters", ()):
+            parameter_name = str(parameter_def.get("name", "") or "")
+            if parameter_def.get("media_type") == "image" and parameter_name in normalized_parameters:
+                normalized_parameters[parameter_name] = _resolve_mcp_media_value(session, normalized_parameters[parameter_name], parameter_name, allow_read_file_system, file_access_policy)
         task = _build_mcp_postprocessing_task(source_path, process_def, normalized_parameters)
         record = jobs.submit(task)
         snapshot = record.snapshot(event_limit=20)
@@ -1017,7 +1348,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
 
     @mcp.tool()
     def wangp_toolbox(action: str | None = None, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Discover or run WanGP media utilities. Omit action for a compact action list; pass action without arguments for its schema; then pass arguments to execute. Media arguments accept Gallery ids; direct server paths require startup permission."""
+        """Discover or run WanGP media utilities. Omit action for a compact action list; pass action without arguments for its schema; then pass arguments to execute. Media arguments accept media IDs returned by wangp_list_gallery; direct server paths require startup permission."""
 
         sandbox_toolbox = get_toolbox()
         action_name = str(action or "").strip()
@@ -1032,7 +1363,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
             raise ValueError(f"Toolbox action '{action_name}' is unavailable in this WanGP runtime.")
         if arguments is None:
             return {"status": "schema", "action": action_defs[0]}
-        resolved_arguments = _resolve_toolbox_arguments(session, sandbox_toolbox, action_name, dict(arguments or {}), allow_read_file_system)
+        resolved_arguments = _resolve_toolbox_arguments(session, sandbox_toolbox, action_name, dict(arguments or {}), allow_read_file_system, file_access_policy)
         validation_error = sandbox_toolbox.validate_tool_call(action_name, resolved_arguments)
         if validation_error:
             raise ValueError(validation_error)
@@ -1045,7 +1376,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         if not isinstance(source, (dict, list)):
             raise TypeError("source must be a settings dict, task dict, manifest dict, or task list")
         _gallery_records(session, limit=500)
-        record = jobs.submit(_resolve_generation_media(session, source, allow_read_file_system))
+        record = jobs.submit(_resolve_generation_media(session, source, allow_read_file_system, file_access_policy))
         if wait:
             record.job.result(timeout=timeout_s)
         return record.snapshot(event_limit=default_job_event_limit if event_limit is None else event_limit)
@@ -1064,11 +1395,20 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         record.job.cancel()
         return record.snapshot(event_limit=default_job_event_limit if event_limit is None else event_limit)
 
+    from shared.utils.plugins import get_deepy_prime_plugin_tools
+
+    for definition in get_deepy_prime_plugin_tools():
+        if definition.requires_file_system and not allow_read_file_system:
+            continue
+        if mcp._tool_manager.get_tool(definition.name) is not None:
+            raise RuntimeError(f"Deepy Prime plugin '{definition.plugin_id}' cannot replace built-in MCP tool '{definition.name}'.")
+        mcp.tool(name=definition.name, title=definition.display_name, description=definition.description)(definition.function)
+
     return mcp
 
 
-def build_inprocess_server(session, toolbox=None, default_job_event_limit: int = 20, allow_read_file_system: bool = False):
-    return build_server_for_session(session, toolbox=toolbox, default_job_event_limit=default_job_event_limit, allow_read_file_system=allow_read_file_system)
+def build_inprocess_server(session, toolbox=None, default_job_event_limit: int = 20, allow_read_file_system: bool = False, file_access_policy=None):
+    return build_server_for_session(session, toolbox=toolbox, default_job_event_limit=default_job_event_limit, allow_read_file_system=allow_read_file_system, compact_model_tools=True, file_access_policy=file_access_policy, io_downloads=True)
 
 
 def build_server(args: argparse.Namespace):
@@ -1107,7 +1447,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default=None, help="Optional host for non-stdio transports.")
     parser.add_argument("--port", type=int, default=None, help="Optional port for non-stdio transports.")
     parser.add_argument("--job-event-limit", type=int, default=20, help="Default number of recent progress events included in job snapshots; use 0 for terminal state/results only.")
-    parser.add_argument("--allow-read-file-system", action="store_true", help="Allow MCP tool arguments to reference arbitrary server filesystem paths. Disabled by default; Gallery ids remain available.")
+    parser.add_argument("--allow-read-file-system", action="store_true", help="Allow MCP tool arguments to reference arbitrary server filesystem paths. Disabled by default; media IDs returned by wangp_list_gallery remain available.")
     return parser.parse_args(argv)
 
 

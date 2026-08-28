@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -25,9 +26,20 @@ DEEPY_COMPACTION_TYPE_KEY = "deepy_compaction_type"
 DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY = "deepy_zero_custom_system_prompt"
 DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY = "deepy_prime_custom_system_prompt"
 DEEPY_PRIME_MCP_SERVERS_KEY = "deepy_prime_mcp_servers"
+DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY = "deepy_mcp_auto_discover_paths"
 DEEPY_ALLOW_READ_FILE_SYSTEM_KEY = "deepy_allow_read_file_system"
+DEEPY_FILE_SYSTEM_PATHS_KEY = "deepy_file_system_paths"
+DEEPY_READ_EVERYWHERE_KEY = "deepy_read_everywhere"
 DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY = "deepy_auto_cancel_queue_tasks"
 DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_KEY = "deepy_separate_requests_with_empty_line"
+DEEPY_TEMPLATE_CONFIG_MIGRATIONS = {
+    DEEPY_TOOL_GEN_VIDEO_KEY: {
+        "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps": "MiniMax H3 FL2VA Pruned Turbo Lightx2v 8 Steps",
+    },
+    DEEPY_TOOL_GEN_VIDEO_WITH_SPEECH_KEY: {
+        "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps With Sound": "MiniMax H3 FL2VA Pruned Turbo Lightx2v 8 Steps With Sound",
+    },
+}
 
 DEEPY_VRAM_MODE_UNLOAD = "unload"
 DEEPY_VRAM_MODE_ALWAYS_LOADED = "always_loaded"
@@ -55,6 +67,13 @@ DEEPY_KV_CACHE_QUANTIZATION_AUTO = "auto"
 DEEPY_KV_CACHE_QUANTIZATION_DEFAULT = DEEPY_KV_CACHE_QUANTIZATION_AUTO
 DEEPY_KV_CACHE_QUANTIZATION_MIN_GGUF_KERNELS_VERSION = "1.0.11"
 DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT = False
+DEEPY_FILE_SYSTEM_ACCESS_DISABLED = "disabled"
+DEEPY_FILE_SYSTEM_ACCESS_READ = "read"
+DEEPY_FILE_SYSTEM_ACCESS_READ_WRITE = "read_write"
+DEEPY_FILE_SYSTEM_ACCESS_DEFAULT = DEEPY_FILE_SYSTEM_ACCESS_DISABLED
+DEEPY_FILE_SYSTEM_PATHS_DEFAULT: list[str] = []
+DEEPY_READ_EVERYWHERE_DEFAULT = False
+DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT = False
 DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT = True
 DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_DEFAULT = True
 DEEPY_CONFIG_FILENAME = "wgp_config.json"
@@ -71,8 +90,12 @@ _DEEPY_DEFAULT_EDIT_IMAGE_ALIASES = {"Qwen_Edit": DEEPY_DEFAULT_EDIT_IMAGE}
 _DEEPY_DEFAULT_GEN_VIDEO_ALIASES = {
     "ltx2_22B_distilled": "LTX-2 2.3 Distilled 1.0",
     "LTX-2 2.3 Distilled": "LTX-2 2.3 Distilled 1.0",
+    **DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_VIDEO_KEY],
 }
-_DEEPY_GEN_VIDEO_WITH_SPEECH_ALIASES = {"LTX-2.3 Distilled With Sound": "LTX-2.3 Distilled 1.0 With Sound"}
+_DEEPY_GEN_VIDEO_WITH_SPEECH_ALIASES = {
+    "LTX-2.3 Distilled With Sound": "LTX-2.3 Distilled 1.0 With Sound",
+    **DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_VIDEO_WITH_SPEECH_KEY],
+}
 _DEEPY_RUNTIME_CONFIG: dict[str, Any] | None = None
 _DEEPY_RUNTIME_CONFIG_FILENAME = ""
 
@@ -252,7 +275,78 @@ def normalize_deepy_auto_cancel_queue_tasks(value: Any) -> bool:
     return bool(value)
 
 
+def normalize_deepy_file_system_access(value: Any) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {DEEPY_FILE_SYSTEM_ACCESS_DISABLED, "", "0", "false", "off", "no"}:
+            return DEEPY_FILE_SYSTEM_ACCESS_DISABLED
+        if normalized in {DEEPY_FILE_SYSTEM_ACCESS_READ_WRITE, "readwrite", "write", "rw", "2"}:
+            return DEEPY_FILE_SYSTEM_ACCESS_READ_WRITE
+        if normalized in {DEEPY_FILE_SYSTEM_ACCESS_READ, "1", "true", "on", "yes"}:
+            return DEEPY_FILE_SYSTEM_ACCESS_READ
+        return DEEPY_FILE_SYSTEM_ACCESS_DISABLED
+    return DEEPY_FILE_SYSTEM_ACCESS_READ if bool(value) else DEEPY_FILE_SYSTEM_ACCESS_DISABLED
+
+
 def normalize_deepy_allow_read_file_system(value: Any) -> bool:
+    return normalize_deepy_file_system_access(value) != DEEPY_FILE_SYSTEM_ACCESS_DISABLED
+
+
+def normalize_deepy_file_system_paths(value: Any) -> list[str]:
+    values = value.splitlines() if isinstance(value, str) else value if isinstance(value, (list, tuple)) else []
+    paths = []
+    seen = set()
+    for item in values:
+        path = str(item or "").strip()
+        key = path.replace("\\", "/").casefold()
+        if not path or key in seen:
+            continue
+        seen.add(key)
+        paths.append(path)
+    return paths
+
+
+def parse_deepy_file_system_paths(value: Any) -> list[tuple[str, str]]:
+    parsed = []
+    aliases = set()
+    for entry in normalize_deepy_file_system_paths(value):
+        if entry[0] in {'"', "'"}:
+            quote = entry[0]
+            end = entry.find(quote, 1)
+            if end < 0:
+                raise ValueError(f"Additional filesystem folder has an unterminated quote: {entry}")
+            tail = entry[end + 1:]
+            if tail and not tail[0].isspace():
+                raise ValueError(f"Filesystem alias must be separated from its quoted path by a space: {entry}")
+            path, remainder = entry[1:end].strip(), tail.strip()
+            if remainder and any(character.isspace() for character in remainder):
+                raise ValueError(f"Filesystem alias must be one word: {remainder}")
+            alias = remainder
+        else:
+            parts = entry.rsplit(None, 1)
+            path, alias = (parts[0], parts[1]) if len(parts) == 2 else (entry, "")
+        if not path:
+            raise ValueError("Additional filesystem folder path is empty.")
+        if alias:
+            if re.fullmatch(r"[A-Za-z0-9_-]+", alias) is None:
+                raise ValueError(f"Filesystem alias may contain only letters, numbers, '_' and '-': {alias}")
+            key = alias.casefold()
+            if re.fullmatch(r"outputs\d*", key):
+                raise ValueError(f"Filesystem alias is reserved for WanGP output folders: {alias}")
+            if key in aliases:
+                raise ValueError(f"Filesystem alias is used more than once: {alias}")
+            aliases.add(key)
+        parsed.append((path, alias))
+    return parsed
+
+
+def normalize_deepy_read_everywhere(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "on", "yes"}
+    return bool(value)
+
+
+def normalize_deepy_mcp_auto_discover_paths(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "on", "yes"}
     return bool(value)
@@ -313,7 +407,10 @@ def normalize_deepy_runtime_config(server_config: dict[str, Any] | None) -> dict
     runtime_config[DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY] = normalize_deepy_custom_system_prompt(runtime_config.get(DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, ""))
     runtime_config[DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY] = normalize_deepy_prime_guidance(runtime_config.get(DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_GUIDANCE_DEFAULT))
     runtime_config[DEEPY_PRIME_MCP_SERVERS_KEY] = normalize_deepy_prime_mcp_servers(runtime_config.get(DEEPY_PRIME_MCP_SERVERS_KEY, {}))
-    runtime_config[DEEPY_ALLOW_READ_FILE_SYSTEM_KEY] = normalize_deepy_allow_read_file_system(runtime_config.get(DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT))
+    runtime_config[DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY] = normalize_deepy_mcp_auto_discover_paths(runtime_config.get(DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT))
+    runtime_config[DEEPY_ALLOW_READ_FILE_SYSTEM_KEY] = normalize_deepy_file_system_access(runtime_config.get(DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_ACCESS_DEFAULT))
+    runtime_config[DEEPY_FILE_SYSTEM_PATHS_KEY] = normalize_deepy_file_system_paths(runtime_config.get(DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_FILE_SYSTEM_PATHS_DEFAULT))
+    runtime_config[DEEPY_READ_EVERYWHERE_KEY] = normalize_deepy_read_everywhere(runtime_config.get(DEEPY_READ_EVERYWHERE_KEY, DEEPY_READ_EVERYWHERE_DEFAULT))
     runtime_config[DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY] = normalize_deepy_auto_cancel_queue_tasks(runtime_config.get(DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY, DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT))
     runtime_config[DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_KEY] = normalize_deepy_separate_requests_with_empty_line(runtime_config.get(DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_KEY, DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_DEFAULT))
     return runtime_config
@@ -337,7 +434,10 @@ def get_deepy_default_runtime_config() -> dict[str, Any]:
         DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY: "",
         DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY: DEEPY_PRIME_GUIDANCE_DEFAULT,
         DEEPY_PRIME_MCP_SERVERS_KEY: {},
+        DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY: DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT,
         DEEPY_ALLOW_READ_FILE_SYSTEM_KEY: DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT,
+        DEEPY_FILE_SYSTEM_PATHS_KEY: list(DEEPY_FILE_SYSTEM_PATHS_DEFAULT),
+        DEEPY_READ_EVERYWHERE_KEY: DEEPY_READ_EVERYWHERE_DEFAULT,
         DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY: DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT,
         DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_KEY: DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_DEFAULT,
     }
@@ -385,14 +485,21 @@ def deepy_requirement_met(server_config: dict[str, Any] | None) -> bool:
 
 def deepy_requirement_error(server_config: dict[str, Any] | None) -> str:
     runtime_config = server_config or {}
+    from shared.remote_llm.config import is_remote_engine, local_enhancer_id, resolve_role_engine
+
+    deepy_engine = resolve_role_engine(runtime_config, "deepy")
+    if is_remote_engine(deepy_engine):
+        if normalize_deepy_type(runtime_config.get(DEEPY_TYPE_KEY, DEEPY_TYPE_DEFAULT)) != DEEPY_TYPE_PRIME:
+            return "External LLM engines require Deepy Prime because only Deepy Prime exposes WanGP's MCP tools."
+        return ""
     try:
-        enhancer_enabled = int(runtime_config.get("enhancer_enabled", 0) or 0)
+        enhancer_enabled = local_enhancer_id(deepy_engine, runtime_config.get("enhancer_enabled", 0))
     except Exception:
         enhancer_enabled = 0
     if enhancer_enabled not in DEEPY_QWEN_ENHANCER_IDS:
         return "Deepy requires Prompt Enhancer to be set to a Qwen3.5VL Abliterated or Qwen3.8VL Uncensored mode in the Extensions tab."
     try:
-        validate_deepy_version_config(runtime_config.get(DEEPY_TYPE_KEY, DEEPY_TYPE_DEFAULT), runtime_config.get(DEEPY_COMPACTION_TYPE_KEY, DEEPY_COMPACTION_TYPE_DEFAULT), runtime_config.get(DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT), runtime_config.get("enhancer_enabled", 0))
+        validate_deepy_version_config(runtime_config.get(DEEPY_TYPE_KEY, DEEPY_TYPE_DEFAULT), runtime_config.get(DEEPY_COMPACTION_TYPE_KEY, DEEPY_COMPACTION_TYPE_DEFAULT), runtime_config.get(DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT), enhancer_enabled)
     except ValueError as exc:
         return str(exc)
     return ""
@@ -411,10 +518,14 @@ def deepy_requirement_message(server_config: dict[str, Any] | None) -> str:
     runtime_config = server_config or {}
     requirement_error = deepy_requirement_error(runtime_config)
     if len(requirement_error) == 0:
+        from shared.remote_llm.config import ENGINE_LABELS, is_remote_engine, resolve_role_engine
+
         version = "Deepy Prime" if normalize_deepy_type(runtime_config.get(DEEPY_TYPE_KEY, DEEPY_TYPE_DEFAULT)) == DEEPY_TYPE_PRIME else "Deepy Zero"
+        engine = resolve_role_engine(runtime_config, "deepy")
+        detail = f" using {ENGINE_LABELS.get(engine, engine.title())} externally" if is_remote_engine(engine) else " with the current Prompt Enhancer and context configuration"
         return (
             "<div style='color:#1b6d44; font-weight:600;'>"
-            f"{version} is available with the current Prompt Enhancer and context configuration."
+            f"{version} is available{detail}."
             "</div>"
         )
     return (
