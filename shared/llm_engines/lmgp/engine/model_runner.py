@@ -66,7 +66,7 @@ class ModelRunner:
         
         self.config = config
         hf_config = config.hf_config
-        self.use_triton_sampling = not bool(getattr(hf_config, "_prompt_enhancer_safe_legacy", False) or getattr(hf_config, "_prompt_enhancer_safe_fused_kernels", False))
+        self.use_triton_sampling = not bool(getattr(hf_config, "_prompt_enhancer_safe_legacy", False))
         self.block_size = config.kvcache_block_size
         self.kv_layout = kvf.layout_of(config)  # None: BF16 cache; otherwise the body formats and exact overlays
         self.enforce_eager = config.enforce_eager
@@ -469,6 +469,8 @@ class ModelRunner:
                     if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                         module.k_cache = module.v_cache = torch.tensor([])
                         module.k_scale = module.v_scale = torch.tensor([])
+                    if hasattr(module, "k_overlay"):  # the mixed layouts' exact overlays and asymmetric minimums, views of the runner's tensors
+                        module.k_overlay = module.v_overlay = module.k_overlay_scale = module.v_overlay_scale = module.k_min = module.v_min = None
                     if hasattr(module, "_q8_speculative_metadata"):
                         module._q8_speculative_metadata.clear()
                     release_sequence_state = getattr(module, "release_sequence_state", None)
@@ -485,16 +487,10 @@ class ModelRunner:
                             module.recurrent_state = None
         except Exception:
             pass
-        if hasattr(self, "kv_cache"):
-            try:
-                del self.kv_cache
-            except Exception:
-                pass
-        if hasattr(self, "kv_cache_scales"):
-            try:
-                del self.kv_cache_scales
-            except Exception:
-                pass
+        # the cache and every view of it (kv_views keep the whole cache alive), the minimums and the exact overlays
+        for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_views", "kv_min_views", "kv_overlay", "kv_overlay_scales"):
+            if hasattr(self, name):
+                delattr(self, name)
         # CUDA graphs captured against previous model/KV pointers are unsafe after runtime reset.
         # Force recapture on next prepare to avoid stale-pointer illegal memory access.
         try:
@@ -560,12 +556,7 @@ class ModelRunner:
         model_ptr = -1
         kv_ptr = -1
         try:
-            if getattr(self.model, "_lm_engine_token_table_mapped", False):  # the table held outside the parameters: a base one, not a streamed block's
-                first_param = self.__dict__.get("_signature_param")
-                if first_param is None:
-                    first_param = self._signature_param = next(param for name, param in self.model.named_parameters() if not name.startswith(self.model._lm_engine_tower_prefix))
-            else:
-                first_param = next(self.model.parameters())
+            first_param = next(self.model.parameters())
             if first_param.is_cuda:
                 model_ptr = int(first_param.data_ptr())
         except Exception:
@@ -675,44 +666,37 @@ class ModelRunner:
         return processor(input_ids, logits)
 
     def _allocate_sample_buffers(self):
-        """Pre-allocate reusable buffers for sampling to avoid repeated tensor creation."""
+        """Pre-allocate reusable buffers for sampling to avoid repeated tensor creation: on CUDA, views of one buffer of locked RAM
+        (mmgp.pinned: exact size, counted with MMGP's pinned memory), not one power-of-two block of PyTorch's pinned allocator each."""
+        from mmgp import pinned
         max_bs = self.config.max_num_seqs
         max_tokens = self.config.max_num_batched_tokens
         max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
-        pin_memory = self._pin_memory_enabled()
-        
-        # Pre-allocate pinned memory buffers on CPU for fast transfer
-        # Must explicitly specify device="cpu" since default device may be "cuda"
-        self._cpu_temperatures = torch.zeros(max_bs, dtype=torch.float32, device="cpu", pin_memory=pin_memory)
-        self._cpu_cfg_scales = torch.zeros(max_bs, dtype=torch.float32, device="cpu", pin_memory=pin_memory)
-        self._cpu_top_ks = torch.zeros(max_bs, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
-        self._cpu_top_ps = torch.zeros(max_bs, dtype=torch.float32, device="cpu", pin_memory=pin_memory)
-        self._cpu_min_ps = torch.zeros(max_bs, dtype=torch.float32, device="cpu", pin_memory=pin_memory)
-        self._cpu_repetition_penalties = torch.zeros(max_bs, dtype=torch.float32, device="cpu", pin_memory=pin_memory)
-        
-        # Pre-allocate decode buffers on CPU with pinned memory
-        self._cpu_input_ids = torch.zeros(max_bs, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
-        self._cpu_speculative_input_ids = torch.zeros(self._max_speculative_draft_tokens + 1, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
-        self._cpu_speculative_overlay_mapping = torch.full((self._max_speculative_draft_tokens + 1,), -1, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
-        self._cpu_positions = torch.zeros(max_bs, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
-        self._cpu_slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
-        self._cpu_context_lens = torch.zeros(max_bs, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
-        self._cpu_overlay_mapping = torch.full((max_bs,), -1, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
-        self._cpu_overlay_base = torch.full((max_bs,), -1, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
-        self._cpu_ring_start = torch.full((max_bs,), 1 << 30, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
-        
-        # Pre-allocate prefill buffers on CPU with pinned memory (optimization to avoid repeated tensor creation)
-        self._cpu_prefill_input_ids = torch.zeros(max_tokens, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
-        self._cpu_prefill_positions = torch.zeros(max_tokens, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
-        self._cpu_prefill_cu_seqlens = torch.zeros(max_bs + 1, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
-        self._cpu_prefill_slot_mapping = torch.zeros(max_tokens, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
-        
-        # Pre-allocate block tables buffer (shared by both decode and prefill)
-        self._cpu_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device="cpu", pin_memory=pin_memory)
-        
-        # Pre-allocate buffer for sequence token IDs (used in logits processor and sampler)
-        # Max length is max_model_len since sequences can be that long
-        self._seq_token_ids_buffer = torch.zeros(max_bs, self.config.max_model_len, dtype=torch.int64, device="cpu", pin_memory=pin_memory)
+        drafts = self._max_speculative_draft_tokens + 1
+        buffers = {  # name: (shape, dtype, initial value)
+            # sampling
+            "_cpu_temperatures": ((max_bs,), torch.float32, 0), "_cpu_cfg_scales": ((max_bs,), torch.float32, 0), "_cpu_top_ks": ((max_bs,), torch.int32, 0),
+            "_cpu_top_ps": ((max_bs,), torch.float32, 0), "_cpu_min_ps": ((max_bs,), torch.float32, 0), "_cpu_repetition_penalties": ((max_bs,), torch.float32, 0),
+            # decoding
+            "_cpu_input_ids": ((max_bs,), torch.int64, 0), "_cpu_speculative_input_ids": ((drafts,), torch.int64, 0), "_cpu_speculative_overlay_mapping": ((drafts,), torch.int32, -1),
+            "_cpu_positions": ((max_bs,), torch.int64, 0), "_cpu_slot_mapping": ((max_bs,), torch.int32, 0), "_cpu_context_lens": ((max_bs,), torch.int32, 0),
+            "_cpu_overlay_mapping": ((max_bs,), torch.int32, -1), "_cpu_overlay_base": ((max_bs,), torch.int32, -1), "_cpu_ring_start": ((max_bs,), torch.int32, 1 << 30),
+            # prefill (prepare_prefill)
+            "_cpu_prefill_input_ids": ((max_tokens,), torch.int64, 0), "_cpu_prefill_positions": ((max_tokens,), torch.int64, 0), "_cpu_prefill_slot_mapping": ((max_tokens,), torch.int32, 0),
+            "_cpu_prefill_cu_seqlens": ((max_bs + 1,), torch.int32, 0), "_cpu_prefill_cu_seqlens_k": ((max_bs + 1,), torch.int32, 0),
+            # block tables (decoding and prefill), the sequences' token ids (logits processors and sampler)
+            "_cpu_block_tables": ((max_bs, max_num_blocks), torch.int32, 0), "_seq_token_ids_buffer": ((max_bs, self.config.max_model_len), torch.int64, 0),
+        }
+        offsets, total = {}, 0
+        for name, (shape, dtype, _) in buffers.items():
+            offsets[name] = total = -(-total // 64) * 64
+            total += math.prod(shape) * dtype.itemsize
+        self._pinned_buffers = pinned.empty(total, "lm") if self._pin_memory_enabled() else None
+        # refused by the reserved RAM or the driver: pageable buffers, whose copies synchronize
+        storage = self._pinned_buffers if self._pinned_buffers is not None else torch.empty(total, dtype=torch.uint8, device="cpu")
+        for name, (shape, dtype, value) in buffers.items():
+            setattr(self, name, storage[offsets[name]:offsets[name] + math.prod(shape) * dtype.itemsize].view(dtype).view(shape).fill_(value))
+        self._prefill_copied = None  # the event of the last copies from the prefill buffers: chunked prefills queue without synchronizing
 
     def _release_sample_buffers(self):
         buffer_names = [
@@ -734,10 +718,16 @@ class ModelRunner:
             "_cpu_prefill_input_ids",
             "_cpu_prefill_positions",
             "_cpu_prefill_cu_seqlens",
+            "_cpu_prefill_cu_seqlens_k",
             "_cpu_prefill_slot_mapping",
             "_cpu_block_tables",
             "_seq_token_ids_buffer",
+            "_prefill_copied",
         ]
+        if getattr(self, "_pinned_buffers", None) is not None:
+            from mmgp import pinned
+            pinned.retire(self._pinned_buffers)  # unlocked at MMGP's next quiet point, once no copy reads it
+            self._pinned_buffers = None
         for name in buffer_names:
             if hasattr(self, name):
                 try:
@@ -1094,19 +1084,21 @@ class ModelRunner:
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         overlay_mapping, overlay_base, ring_start = self._overlay_context(seqs, [(seq.num_cached_tokens, len(seq)) for seq in seqs])
+        if self._prefill_copied is not None:
+            self._prefill_copied.synchronize()  # the previous prefill's copies have read the buffers refilled below
+        staged = lambda buffer, values: self._to_runtime_device(buffer[:len(values)].copy_(torch.tensor(values, dtype=buffer.dtype)))
         if use_prompt_embeds:
             input_ids = None
             positions = self._to_runtime_device(torch.cat(prompt_position_ids, dim=1).unsqueeze(1).contiguous())
             inputs_embeds = self._to_runtime_device(torch.cat(prompt_embeds, dim=0).unsqueeze(0).contiguous())
         else:
-            pin_memory = self._pin_memory_enabled()
-            input_ids = self._to_runtime_device(torch.tensor(input_ids, dtype=torch.int64, pin_memory=pin_memory))
-            positions = self._to_runtime_device(torch.tensor(positions, dtype=torch.int64, pin_memory=pin_memory))
+            input_ids = staged(self._cpu_prefill_input_ids, input_ids)
+            positions = staged(self._cpu_prefill_positions, positions)
             inputs_embeds = None
-        pin_memory = self._pin_memory_enabled()
-        cu_seqlens_q = self._to_runtime_device(torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=pin_memory))
-        cu_seqlens_k = self._to_runtime_device(torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=pin_memory))
-        slot_mapping = self._to_runtime_device(torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=pin_memory))
+        cu_seqlens_q = staged(self._cpu_prefill_cu_seqlens, cu_seqlens_q)
+        cu_seqlens_k = staged(self._cpu_prefill_cu_seqlens_k, cu_seqlens_k)
+        slot_mapping = staged(self._cpu_prefill_slot_mapping, slot_mapping)
+        self._prefill_copied = torch.cuda.current_stream().record_event() if self._pin_memory_enabled() else None
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, has_previous_state=has_previous_state,
                     overlay_mapping=overlay_mapping, overlay_base=overlay_base, ring_start=ring_start)
         return input_ids, positions, inputs_embeds
@@ -2169,9 +2161,7 @@ class ModelRunner:
             if prepare_runtime_buffers is not None:
                 prepare_runtime_buffers(model_device)
             from shared.kernels import gguf_short_batch
-            # a token table read in place from RAM (outside the parameters) is timed as before: its shape may be the head's (Bonsai)
-            extra = (self.model.embed_tokens.weight,) if getattr(self.model, "_lm_engine_token_table_mapped", False) else ()
-            choose_short_batch_kernels = lambda: gguf_short_batch.prepare(self.model, llamacpp_gguf_cuda, extra)
+            choose_short_batch_kernels = lambda: gguf_short_batch.prepare(self.model, llamacpp_gguf_cuda)
         except ImportError:
             pass
 
