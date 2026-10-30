@@ -77,6 +77,7 @@ class ModelSelectionTests(unittest.TestCase):
                     get_parent_model_type=parent_model, get_model_family=model_family,
                     get_model_def=lambda model_type: {} if model_type in MODEL_TYPES else None,
                     model_types=MODEL_TYPES, models_def=dict.fromkeys(MODEL_TYPES, {}),
+                    retired_model_types={}, retired_model_selection=lambda entry: entry,
                     args=SimpleNamespace(advanced=False), CONFIG_FILENAME="unused.json",
                 )
                 exec(compile(ast.Module(body=tree.body[start:end], type_ignores=[]), "wgp.py", "exec"), namespace)

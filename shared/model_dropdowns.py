@@ -70,8 +70,8 @@ class DropdownDeps:
 
 
 def compact_name(family_name, model_name):
-    if model_name.startswith(family_name):
-        suffix = model_name[len(family_name):]
+    suffix = model_name[len(family_name):]
+    if model_name.startswith(family_name) and not suffix[:1].isalpha():  # a whole word: "Animate" leaves "AnimateAnyMesh" whole
         version = family_name.rsplit(" ", 1)[-1]
         if suffix.startswith(".") and version.isdigit():
             return version + suffix
@@ -130,7 +130,8 @@ def expand_model_selection(selection, model_types, get_parent_model_type, get_mo
         if level == 3:
             expanded.append(key)
         else:
-            expanded += [model_type for model_type in model_types if (get_model_family(model_type, for_ui=True) if level == 1 else get_parent_model_type(model_type)) == key]
+            # a family: its group in the selector, or the handler's family (3D models are grouped by goal since 2026-10-29)
+            expanded += [model_type for model_type in model_types if (key in (get_model_family(model_type, for_ui=True), get_model_family(model_type)) if level == 1 else get_parent_model_type(model_type) == key)]
     if inverted:
         excluded = set(expanded)
         return [model_type for model_type in model_types if model_type not in excluded]
