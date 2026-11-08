@@ -1,6 +1,6 @@
 # Spatial Upsampler / Visual Refiner Plugin API
 
-Spatial upsamplers and visual refiners (Lanczos, FlashVSR, PiD, H3 Face Refiner,
+Spatial upsamplers and visual refiners (Lanczos, FlashVSR, RelayVSR, SeedVR2, PiD, H3 Face Refiner, TaoMate-FVSR Face Refiner,
 Chain-of-Zoom, VAE upscalers, ...) are
 registered in `postprocessing/spatial_upsamplers.py`. Each upsampler declares itself and its
 capabilities through a handler object; the registry owns dropdown state, value
@@ -38,23 +38,61 @@ Decoded-media handlers also declare `postprocessing_category`:
 
 FlashVSR v1.1 and FlashVSR+ Turbo have separate selections, including their
 two-pass variants. **Configuration > Extensions > FlashVSR > Model** controls
-which version is normally shown. **Extract Settings** restores the saved
+which version is normally shown. Saving a version change updates the generation
+and gallery menus immediately. A selected FlashVSR method keeps its scale and
+one-pass or two-pass setting. **Extract Settings** restores the saved
 version and scale even if the current configuration hides that version;
 running those restored settings uses that version without changing the
 configuration preference. Existing `flashvsr` and `flashvsr2pass` settings mean
 FlashVSR v1.1; `flashvsrplus` and `flashvsrplus2pass` mean FlashVSR+ Turbo.
 
+FlashVSR remembers what it computed for the last frames of the video so far.
+With **Configuration > Extensions > Postprocessor VRAM Usage** set to **Minimum**,
+that memory stays in RAM and the GPU holds one layer of it at a time, the least
+VRAM. With **Manual Choice** or **Dynamic** it stays in VRAM as far as the VRAM
+allows, which speeds the upscaling further.
+
 ## SeedVR2 Models
 
 SeedVR2 3B and SeedVR2 7B have separate selections, and
 **Configuration > Extensions > SeedVR2 > SeedVR2 Model** controls which one is
-normally shown (3B by default). The two trade appearance for fidelity: in the
+normally shown (3B by default). Saving a change switches an active SeedVR2
+selection to that model at the same scale. The two trade appearance for fidelity: in the
 authors' comparisons 3B looks better on AI-generated and real-world video,
 while 7B stays closer to the source on degraded footage. 7B downloads as an
 INT8 file a little larger than 3B and runs slightly slower. **Extract Settings**
 restores the saved model even when the configuration hides it. Existing
 `seedvr2` settings mean SeedVR2 3B; `seedvr2_7b` means SeedVR2 7B. Media Flow's
 SeedVR2 processes use the configured model.
+
+## RelayVSR
+
+RelayVSR restores detail while upscaling real-world and generated video,
+several times faster than FlashVSR+ Turbo. Every 15 frames a one-step
+Wan 2.2 5B model generates a detailed keyframe; a small decoder then carries
+the detail of the two keyframes around each frame to every frame. Images are
+processed as one-frame videos.
+
+It has two models. The x4 model serves the ratios above x2. **RelayVSR X2**,
+LightX2V's native x2 version, serves x1 to x2: it does a quarter of the x4
+model's work with a quarter of its memory, more than twice as fast. Other ratios
+are resized from the model's output. **Configuration > Extensions > RelayVSR >
+RelayVSR Model For Upscaling Up To x2** can use the x4 model there instead,
+resized down. Each model downloads on its first use.
+
+Its memory grows with the size of the source, not with the length of the
+video: the keyframe model remembers its last four keyframes, in INT8, about
+4.6 GB for an 832x480 source and 10.5 GB for 1280x720 with the x4 model, a
+quarter of that with RelayVSR X2. Where it lives follows
+**Configuration > Extensions > Postprocessor VRAM Usage**:
+- **Minimum** keeps it in RAM: the GPU holds one layer of it at a time, the
+  least VRAM, at some cost in speed (each layer is brought in as it runs).
+- **Manual Choice** and **Dynamic** keep it in VRAM as far as the VRAM allows,
+  the rest in RAM, brought to the GPU ahead of each layer, which costs little
+  speed: a source whose memory exceeds the GPU's still runs.
+
+RelayVSR suits sources up to about 540p at x4, and larger ones at x2. Its
+keyframe models download in INT8, whatever the transformer quantization.
 
 ## Handler contract
 
@@ -99,6 +137,7 @@ class MyUpsampler:
     def upscale(self, sample, value, *, seed, ..., abort_callback, progress_callback): ...
     # progress_callback(phase, current=None, total=None, unit=None): unit (e.g. "tiles") labels the counter, default "steps"
     def download(self, process_files, send_cmd=None, status_text=None, spatial_upsampling=None): ...
+    def query_checkpoint_inventory(self): ...                 # all checkpoint variants, independent of the selected settings; see PLUGINS.md
     def load_upsampler(self, value, **kwargs): ...            # optional pre-dispatch load hook
     def supports_loaded_model(self, value, context, **kwargs): ... # optional core-model borrowing
     def release_private_runtime(self): ...                    # optional before borrowing core model
@@ -281,6 +320,9 @@ Upsampler settings are stored under `wgp_config["spatial_upsamplers"][config_key
 Handlers can read old top-level keys during migration with `legacy_config()`, but
 those keys are deleted after the nested section is written.
 
+RelayVSR stores `x2_model` (`x2`: RelayVSR X2 for ratios up to x2, or `x4`)
+under `spatial_upsamplers.relayvsr`.
+
 SeedVR2 stores `model` (`3b` or `7b`) and `window_size` under
 `spatial_upsamplers.seedvr2`. For `window_size`, `0` selects the
 GPU-based automatic limit, `-1` disables windowing, and positive values are
@@ -306,6 +348,15 @@ the VAE's `8n+1` frame cadence; window size ranges from 9 to 481 frames, with 81
 as the default. The values are read at the start of every native or Media Flow
 upscale. Audio remains under the existing WGP and Media Flow preservation paths;
 the LTX spatial upsampler itself only returns video frames.
+
+**Face refiners** share `postprocessing/face_refiner`: `face.py` (detection, identity tracks, crops, the choice of
+a reference, paste-back) and `bridge.py`, a `FaceRefinerBridge` to subclass, with `PrivateRuntime` and
+`model_step_callback` for refiners running a model of their own. A new refiner declares its method, parameters and
+files, and its `open_engine(job)` returns an object with `prepare(tracked_faces)`, `window_count(frames)`,
+`refine_segment(segment)` (restored crops, uint8) and `close()`.
+`canvas_tiers` in its configuration restricts the crops to the square sizes a model works at. A processor running
+another one lists that one's files with `download_defs_for_value`. H3 Face Refiner (`h3facerefine`) and TaoMate-FVSR
+Face Refiner (`taomatefvsr`) are the two examples.
 
 The same handler also exposes **LTX 2.5 Detail Refiner** (`ltx25_refine`, x1,
 x1.5 or x2) with the Refine Details IC-LoRA on the LTX 2.5 distilled checkpoint.

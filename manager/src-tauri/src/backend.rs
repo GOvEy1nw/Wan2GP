@@ -16,7 +16,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Action { Hardware, CondaEnvironments, DetectInstallation, ManagerUpdate, Catalog, Sources, Register, Inspect, Preview, Apply, Recover, Versions, Launch, Demo }
+enum Action { Hardware, CondaEnvironments, DetectInstallation, ManagerUpdate, LatestVersions, Catalog, Sources, Register, Inspect, Preview, Apply, Recover, Versions, RemoveVersion, Launch, Demo }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -282,6 +282,16 @@ fn start_job(window: WebviewWindow, app: tauri::AppHandle, state: tauri::State<A
     }
     let mut jobs = state.jobs.lock().unwrap();
     if jobs.values().filter(|job| !job.snapshot.lock().unwrap().done).count() >= 8 { return Err("Wait for another operation to finish".into()); }
+    // Worker cleanup reads the registered roots from preferences. An in-flight
+    // registration or activation publishes its new environment in finish().
+    let changes_registry = |action: &Action| matches!(action, Action::Register | Action::Apply | Action::Recover);
+    if jobs.values().any(|job| {
+        let other = job.snapshot.lock().unwrap();
+        !other.done && ((matches!(action, Action::RemoveVersion) && changes_registry(&other.action))
+            || (changes_registry(&action) && matches!(other.action, Action::RemoveVersion)))
+    }) {
+        return Err("Wait for installation changes and saved version removal to finish before starting another change.".into());
+    }
     if matches!(action, Action::Launch) && jobs.values().any(|job| { let s = job.snapshot.lock().unwrap(); !s.done && matches!(s.action, Action::Launch) && s.args["root"] == args["root"] }) { return Err("This installation is already starting or running".into()); }
     if jobs.len() >= 40 {
         let completed: Vec<String> = jobs.iter().filter(|(_, job)| job.snapshot.lock().unwrap().done).map(|(id, _)| id.clone()).take(20).collect();
@@ -359,6 +369,44 @@ fn set_launch_options(window: WebviewWindow, state: tauri::State<AppState>, opti
     Ok(preferences_view(&preferences))
 }
 
+/// COM objects of the main thread, carried through the dialog's thread and used again only on the main thread.
+#[cfg(windows)]
+struct MainThreadOnly<T>(T);
+#[cfg(windows)]
+unsafe impl<T> Send for MainThreadOnly<T> {}
+#[cfg(windows)]
+impl<T> MainThreadOnly<T> { fn take(self) -> T { self.0 } }
+
+// WebView2 saves to the Downloads folder without asking. The deferral holds the download while the dialog is open,
+// so that its event ends at once and the main thread keeps pumping messages for the dialog's owner.
+#[cfg(windows)]
+fn ask_where_to_save(webview: tauri::webview::PlatformWebview, window: WebviewWindow) -> windows_core::Result<()> {
+    use webview2_com::{take_pwstr, DownloadStartingEventHandler, Microsoft::Web::WebView2::Win32::ICoreWebView2_4};
+    use windows_core::{Interface, HSTRING, PWSTR};
+    let handler = DownloadStartingEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else { return Ok(()) };
+        let mut path = PWSTR::null();
+        let deferral = unsafe { args.ResultFilePath(&mut path)?; args.GetDeferral()? };
+        let suggested = PathBuf::from(take_pwstr(path));
+        let extension = suggested.extension().unwrap_or_default().to_string_lossy().into_owned();
+        let mut dialog = window.dialog().file().set_parent(&window).set_file_name(suggested.file_name().unwrap_or_default().to_string_lossy());
+        if !extension.is_empty() { dialog = dialog.add_filter(extension.to_uppercase(), &[&extension]); }
+        let (app, pending) = (window.app_handle().clone(), MainThreadOnly((args, deferral)));
+        dialog.save_file(move |choice| {
+            let _ = app.run_on_main_thread(move || unsafe {
+                let (args, deferral) = pending.take();
+                match choice.and_then(|file| file.into_path().ok()) {
+                    Some(path) => { let _ = args.SetResultFilePath(&HSTRING::from(path.as_os_str())); }
+                    None => { let _ = args.SetCancel(true); }
+                }
+                let _ = deferral.Complete();
+            });
+        });
+        Ok(())
+    }));
+    unsafe { webview.controller().CoreWebView2()?.cast::<ICoreWebView2_4>()?.add_DownloadStarting(&handler, &mut 0) }
+}
+
 #[tauri::command]
 async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String, presentation: String) -> Result<(), String> {
     authorize(&window)?;
@@ -379,10 +427,13 @@ async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri:
             }
             let origin = parsed.origin().ascii_serialization();
             let title = format!("WanGP App - {installation_name}");
-            tauri::WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed)).title(&title).inner_size(1280.0, 850.0)
+            let window = tauri::WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed)).title(&title).inner_size(1280.0, 850.0)
+                .disable_drag_drop_handler()  // WebView2 keeps its own drag and drop: pages drag their items and take dropped files, as in a browser
                 .icon(tauri::include_image!("../assets/wangp.png")).map_err(|e| e.to_string())?
                 .on_document_title_changed(move |window, _| { let _ = window.set_title(&title); })
                 .on_navigation(move |url| url.origin().ascii_serialization() == origin).build().map_err(|e| e.to_string())?;
+            #[cfg(windows)]
+            window.with_webview({ let window = window.clone(); move |webview| { let _ = ask_where_to_save(webview, window); } }).map_err(|e| e.to_string())?;
             Ok(())
         }
         "browser" => {

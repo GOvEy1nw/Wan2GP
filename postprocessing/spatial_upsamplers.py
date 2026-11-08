@@ -129,9 +129,11 @@ spatial_upsampler_handlers = [
     "postprocessing.lanczos.wgp_bridge.LanczosUpsampler",
     "postprocessing.dlss5.spatial_upsampler.DLSS5SpatialUpsampler",
     "postprocessing.flashvsr.wgp_bridge.FlashVSRBridge",
+    "postprocessing.relayvsr.wgp_bridge.RelayVSRBridge",
     "postprocessing.seedvr2.wgp_bridge.SeedVR2Bridge",
     "postprocessing.pid.wgp_bridge.PiDBridge",
     "postprocessing.h3_face_refiner.wgp_bridge.H3FaceRefinerBridge",
+    "postprocessing.taomate_fvsr.wgp_bridge.TaoMateFVSRBridge",
     "postprocessing.chain_of_zoom.wgp_bridge.ChainOfZoomBridge",
     "postprocessing.ltx2_upsampler.wgp_bridge.LTXVideoUpsamplerBridge",
     "postprocessing.hi3d_refiner.wgp_bridge.Hi3DRefinerBridge",
@@ -446,6 +448,18 @@ def query_download_defs(enabled_only: bool = True) -> list[dict[str, Any]]:
     return definitions
 
 
+def download_defs_for_value(spatial_upsampling) -> list[dict[str, Any]]:
+    """The files of a selected value through its owner, without downloading them, for a processor that runs another one."""
+    import inspect
+
+    handler = find_upsampler(spatial_upsampling)
+    query = getattr(handler, "query_download_defs", None) or getattr(handler, "query_download_def", None)
+    if query is None:
+        return []
+    result = query(**({"spatial_upsampling": spatial_upsampling} if "spatial_upsampling" in inspect.signature(query).parameters else {}))
+    return [] if result is None else result if isinstance(result, list) else [result]
+
+
 def download_for_value(spatial_upsampling, process_files, **kwargs):
     handler = find_upsampler(spatial_upsampling)
     if handler is None or not hasattr(handler, "download"):
@@ -693,6 +707,23 @@ def normalize_upsampling_value(value) -> str:
     handler = find_upsampler_by_method(split[0])
     normalized = None if handler is None else handler.build_value(*split)
     return normalized or text
+
+
+def method_preference_changes(old_config, new_config):
+    """Remap live selections only when the user changes the configured model. Saved settings keep their explicit method."""
+    replacements = {}
+    for handler in upsampler_handlers(UPSAMPLER_TYPE_POSTPROCESSING):
+        if not hasattr(handler, "preferred_method") or read_config_section(old_config, handler).get("model") == read_config_section(new_config, handler).get("model"):
+            continue
+        for _, method in _handler_def(handler).get("methods", []):
+            if not handler.method_visible(method):
+                replacements[method] = handler.preferred_method(method)
+    return replacements
+
+
+def apply_method_preference(value, replacements):
+    split = split_upsampling_value(value) if replacements else None
+    return build_upsampling_value(replacements[split[0]], split[1]) if split and split[0] in replacements else value
 
 
 def format_upsampling_label(value) -> str:

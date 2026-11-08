@@ -6,13 +6,15 @@ WanGP Manager guides installation, installs Python and dependencies, launches Wa
 
 For an existing installation, choose **Install / Add → Use existing installation** at the top of the page. Browse to the WanGP folder: Manager detects its saved environment and local `env_uv`, `venv`, `.venv` or `env` folders. A single compatible environment is selected automatically. Under **Choose another Conda environment or Python**, you can pick a discovered Conda environment or browse to Python. Discovery and registration leave packages unchanged.
 
-Choose **Update WanGP → Prepare latest update**, review the result and confirm **Update WanGP**. Manager installs the selected version's dependencies, recommended kernels and installed plugins' declared requirements. It updates a separate Conda copy or builds a new uv/venv environment, validates it, then switches source and environment together. When a previously validated dependency recipe is unchanged, a compatible environment can be retained. **Choose another version or change dependencies** lets you select an older build; **Saved versions and rollback → Preview restore** returns to a saved source and environment pair. Your models, plugins, settings and outputs stay in place.
+Choose **Update WanGP → Prepare latest update**, review the result and confirm **Update WanGP**. Manager checks the current Python environment against the selected version, optional kernels and installed plugins. Automatic updates keep compatible packages, including on the first update of an existing installation. When packages need to change, Manager validates a separate Conda clone or a new virtual environment before switching. **Choose another version or change dependencies** lets you select an older build.
+
+Under **Saved versions and rollback**, use **Preview restore** to return to a saved source and environment pair. Use **Remove** to discard a rollback version. Manager reclaims an environment it created after its last reference is removed. It preserves imported environments and environments used by another saved version, the active installation or another registered installation.
 
 Existing-installation updates require Git and a WanGP Git checkout with no pending tracked source edits; Conda installations also require Conda. Stop WanGP and save or stash those edits first. Allow disk space for another environment; retained environments are kept for rollback. Launch through Manager or WanGP's installation scripts to use the selected environment: activating the original Conda environment by its old name still selects the unchanged original. Manager keeps the chosen source revision separate from your Git branches. Installations without a Git checkout or virtual environment can be launched, but cannot be updated through this workflow.
 
 To update **Manager itself**, use **Preferences → Check for Manager updates**, download the latest installer, close Manager and run it. The installer defaults to **Update in place** when upgrading and preserves your installation list and preferences; uninstalling first is unnecessary. The permanent download URL stays the same across releases.
 
-It is recommended to use Python 3.10.9, PyTorch 2.7.1 with Cuda 12.8 for GTX 10XX and Python 3.11.14, PyTorch 2.10 with Cuda 13.0/13.1 for RTX 20XX - RTX 50XX. RTX 20XX requires Triton 3.2.
+It is recommended to use Python 3.10.9, PyTorch 2.7.1 with Cuda 12.6 for GTX 10XX and Python 3.11.14, PyTorch 2.10 with Cuda 13.0/13.1 for RTX 20XX - RTX 50XX. RTX 20XX requires Triton 3.2.
 
 It is not recommended to use either PytTorch 2.8.0 as some System RAM memory leaks have been observed when switching models or 2.9.0 which has some Convolution 3D perf issues (VAE VRAM requirements explode).
 
@@ -38,7 +40,7 @@ pip install -r requirements.txt
 
 ### GTX 10xx Installation
 
-you must install Cuda 12.8: https://developer.nvidia.com/cuda-12-8-0-download-archive
+you must install Cuda 12.6: https://developer.nvidia.com/cuda-12-6-0-download-archive
 
 Then open a Terminal Window get in the parent folder where you would to install WanGP and then type in:
 ```bash
@@ -46,9 +48,11 @@ git clone https://github.com/deepbeepmeep/Wan2GP.git
 cd Wan2GP
 conda create -n wan2gp python=3.10.9
 conda activate wan2gp
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/test/cu128
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 ```
+
+Use the CUDA 12.6 build on Windows and Linux: the Linux CUDA 12.8 build of PyTorch 2.7.1 only runs on RTX 20XX and newer, so WanGP stops at startup with "no kernel image is available for execution on the device" on a GTX 10XX.
 
 ## INT8 Math Kernels
 

@@ -35,8 +35,7 @@ def make_deps(selection=(), inverted=None, current="image"):
     return SimpleNamespace(
         transformer_types=list(selection), displayed_model_types=list(MODEL_TYPES),
         transformer_type=current, server_config={} if inverted is None else {"invert_model_selection": inverted},
-        get_parent_model_type=parent_model, get_base_model_type=parent_model,
-        get_model_family=model_family, three_levels_hierarchy=True,
+        get_parent_model_type=parent_model, get_model_family=model_family,
     )
 
 
@@ -100,7 +99,7 @@ class ModelSelectionTests(unittest.TestCase):
             gr=SimpleNamespace(Dropdown=lambda **kwargs: kwargs),
             get_model_output_filter=lambda *args: "video",
             get_filtered_dropdown_model_types=lambda deps, model_filter, types: types,
-            get_sorted_dropdown=lambda deps, types, family, current, three_levels: ([(family, family)], [(parent_model(current), parent_model(current))], [(current, current)]),
+            get_sorted_dropdown=lambda deps, types, family, current: ([(family, family)], [(parent_model(current), parent_model(current))], [(current, current)]),
             get_family_dropdown_model_types=lambda deps, family, types: types,
             get_model_download_status_maps=lambda *args: ({}, {}),
             decorate_dropdown_choices_with_status=lambda choices, statuses: choices,

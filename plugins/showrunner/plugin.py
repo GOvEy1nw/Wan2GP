@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from pathlib import Path
@@ -25,6 +26,22 @@ class _Progress:
             self._on_progress(update)
 
 
+ADVISED_CONTEXT = 64000  # tokens: a production's conversation is long, and below this Deepy keeps condensing it
+
+
+def advice_for_deepy(context_tokens: int, kv_cache: str, lower_kv_cache: bool, room_for_context: bool = True) -> str:
+    """One notice for what a local Deepy's settings cost a production: a short context, a KV cache that could leave room for a longer one. Empty when both are fine. room_for_context: this GPU holds
+    the model with the advised context; on a smaller one, following the advice would push the model out of VRAM."""
+    short, large = room_for_context and context_tokens < ADVISED_CONTEXT, lower_kv_cache and kv_cache in ("", "int8")
+    context, cache = f"Context Window Tokens to at least 64K (it is {context_tokens // 1000}K)", f"KV Cache Quantization to Q4 or lower (it is {'INT8' if kv_cache else 'BF16'})"
+    where = "In Configuration > Prompt Enhancer / Deepy."
+    if short and large:
+        return f"For long productions, set Deepy's {context} and its {cache}, which fits that context in less VRAM. {where}"
+    if short:
+        return f"For long productions, set Deepy's {context}: with less, it keeps condensing the conversation and loses details. {where}"
+    return f"To fit more context in the same VRAM, set Deepy's {cache}. {where}" if large else ""
+
+
 class WanGPHost:
     """What Showrunner needs from WanGP: Deepy jobs, the production workspaces, the web UI queue and the output codec settings."""
 
@@ -42,7 +59,7 @@ class WanGPHost:
         if client.unavailable_reason:
             return client.unavailable_reason
         if client.deepy_type != "prime":
-            return "Showrunner needs Deepy Prime (local or with a remote agent): Deepy Zero cannot plan long productions. Choose Prime in Configuration > Deepy."
+            return "Showrunner needs Deepy Prime (local or with a remote agent): Deepy Zero cannot plan long productions. Choose Prime in Configuration > Prompt Enhancer / Deepy, or make the shots yourself: + Shot, then Render now."
         return ""
 
     def director_info(self) -> dict:
@@ -51,10 +68,29 @@ class WanGPHost:
             kind = self._client().deepy_type
         except RuntimeError:
             kind = None
-        return {"available": not reason, "reason": reason, "type": kind}
+        return {"available": not reason, "reason": reason, "type": kind, "advice": "" if reason else self.deepy_advice()}
+
+    def deepy_advice(self) -> str:
+        from shared.deepy.config import DEEPY_CONTEXT_TOKENS_DEFAULT, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT, DEEPY_KV_CACHE_QUANTIZATION_KEY, deepy_lower_kv_cache_supported, get_deepy_runtime_config, normalize_deepy_context_tokens, resolve_deepy_kv_cache_quantization
+        from shared.deepy.onboarding import DEEPY_FULL_CONTEXT_MIN_VRAM_GB, deepy_performance_warning, reported_vram
+        from shared.remote_llm.config import is_remote_engine, resolve_role_engine
+        config = get_deepy_runtime_config()
+        if is_remote_engine(resolve_role_engine(config, "deepy")):  # a remote agent has its own context
+            return ""
+        warning, vram = deepy_performance_warning(config), reported_vram()
+        advice = advice_for_deepy(normalize_deepy_context_tokens(config.get(DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT)), resolve_deepy_kv_cache_quantization(config.get(DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT))[0], deepy_lower_kv_cache_supported(), not warning and (vram == 0 or vram >= DEEPY_FULL_CONTEXT_MIN_VRAM_GB))
+        return " ".join(part for part in (warning, advice) if part)
 
     def production_workspace(self, title: str, folder: Path) -> str:
         return self._client().ensure_workspace(f"Showrunner - {title}"[:120], folder)
+
+    def gallery_media(self, workspace: str, media_id: str) -> str | None:
+        """The file of a Gallery media id in a production's workspace, None when its Gallery has no such media."""
+        return next((item["path"] for item in self._client().gallery(workspace) if item["id"] == media_id), None)
+
+    def gpu_turn(self, cancelled):
+        """The turn of renders made without the showrunner: after the showrunners at work in other productions, in order with them, never beside Deepy's model."""
+        return self._client().turn(cancelled)
 
     def run_director(self, prompt: str, *, session_dir: Path, workspace: str, title: str, instructions: str = ""):
         return self._client().run(prompt, session_dir=session_dir, workspace=workspace, title=title[:120], instructions=instructions)
@@ -76,6 +112,32 @@ class WanGPHost:
         print(f"[Showrunner] The director paused: {(free() - before) / 2 ** 30:.1f} GB of VRAM freed.", flush=True)
         return True
 
+    def lip_reader(self):
+        """How a shot's lips follow the voice: a function for the shots of one review, whose model goes with it."""
+        from shared.deepy import lip_sync
+        models = lip_sync.load_models()
+        return lambda video, start_s, frames, fps, voice, voice_at: lip_sync.measure(video, start_s, frames, fps, voice, voice_at, models)
+
+    def speaker_turns(self, ctx, path) -> list[tuple[str, str]]:
+        """Who is heard in a version, as (speaker number, words) turns, when Nemotron is enabled in the Deepy configuration; [] otherwise."""
+        from shared.deepy.config import advanced_transcription_model
+        import re
+        if not advanced_transcription_model():
+            return []
+        result = ctx.call("wangp_toolbox", {"action": "advanced_transcription", "arguments": {"media_id": ctx.virtualize(str(path)), "speakers": True, "timestamps": "turn"}})
+        return re.findall(r"Speaker (\d+): (.*)", str((result.get("result") or result).get("text") or ""))
+
+    def voice_pitch(self, path) -> float | None:
+        """The median pitch of a voice alone (a voice sample, a spoken line, a song's vocal stem)."""
+        from shared.deepy.audio_inspection import voice_pitch
+        return voice_pitch(str(path))
+
+    def song_words(self, path, language: str | None = None) -> list[tuple[str, float, float]]:
+        """The words heard in a song with their times. Each stretch is read on its own: read after the words before it, a transcript of a song falls into repeating its chorus."""
+        from shared.deepy import transcription
+        payload = transcription.transcribe_media(str(path), timestamp_type="word", language=language, condition_on_previous_text=False)
+        return [(word["word"], word["start"], word["end"]) for segment in payload["segments"] for word in segment.get("words", []) if word["start"] is not None and word["end"] is not None]
+
     def submit_generation(self, settings: dict, workspace: str, on_progress=None):
         """settings may name a Deepy template ("task/name"), as the shots' do: they start from its settings, as with wangp_generate (whose
         expansion lives inside the MCP server): the template's example prompts dropped, the shot's keys over it, custom_settings merged."""
@@ -94,9 +156,10 @@ class WanGPHost:
         """Deepy's templates of the categories a production uses, as Deepy's settings list them (the built-in ones and the custom one selected
         there), plus the custom templates in `keep` ("category/name") that Showrunner still uses after Deepy's settings moved on; with what the
         video ones take: reference images ("I" in video_prompt_type) and driving audio ("A" in audio_prompt_type)."""
+        from shared import resolutions
         from shared.deepy import tool_settings
         from shared.deepy.ui_settings import get_persisted_assistant_tool_ui_settings
-        from .templates import ROLES, VIDEO_TASKS
+        from .templates import EDIT_TASKS, ROLES, VIDEO_TASKS
         settings = get_persisted_assistant_tool_ui_settings(self.plugin.server_config)
         catalog = []
         for task in (role["task"] for role in ROLES):
@@ -105,13 +168,28 @@ class WanGPHost:
             choices = {variant: label for current in (default, *kept) for label, variant in tool_settings.list_tool_variant_choices(task, current_variant=current)}
             for variant, label in choices.items():
                 preset = tool_settings.clone_tool_preset(task, variant)  # the model type of every template: speech models differ in how they take cues
-                video = preset if task in VIDEO_TASKS else {}
-                sources = (self.plugin.get_model_def(video["model_type"]) or {}).get("audio_prompt_type_sources") or {} if video else {}
-                refs = str((preset if task in (*VIDEO_TASKS, "edit_image") else {}).get("video_prompt_type") or "")  # image edits take the cast's pictures too
+                video = preset if task in (*VIDEO_TASKS, *EDIT_TASKS) else {}
+                model_def = (self.plugin.get_model_def(video["model_type"]) or {}) if video else {}
+                if task in EDIT_TASKS and not model_def.get("video_edit"):  # a remake's shots take painted frames and pins: only a model made for that (Viggle Remake) is offered
+                    continue
+                sources = model_def.get("audio_prompt_type_sources") or {}
+                refs = str((preset if task in (*VIDEO_TASKS, *EDIT_TASKS, "edit_image") else {}).get("video_prompt_type") or "")  # image edits take the cast's pictures too
                 catalog.append({"task": task, "category": tool_settings.TOOL_DISPLAY_NAMES[task], "name": variant, "label": label, "default": variant == default,
                                 "model_type": preset.get("model_type"), "refs": "I" in refs, "audio": "A" in str(video.get("audio_prompt_type") or ""),
+                                "video_edit": model_def.get("video_edit"), "needs_mask": task in EDIT_TASKS and "A" in refs,  # what a remake must prepare for it
+                                "pixels": resolutions.resolution_budget(model_def)["default"] if task in EDIT_TASKS else None,
                                 "soundtrack": "AS" in (sources.get("selection") or []),  # its model can follow an audio_guide kept as the soundtrack
-                                "sized_by_ref": "K" in refs})  # its output takes the first reference's size, not the production's format
+                                "spoken_line": model_def.get("spoken_line_prompt"),  # how its model takes a line to voice, written in its prompt
+                                "sized_by_ref": "K" in refs,  # its output takes the first reference's size, not the production's format
+                                "shortest_s": math.floor(model_def.get("frames_minimum", 0) / model_def.get("fps", 16) * 1000) / 1000,  # the shortest take its model makes
+                                "take_frames": [model_def.get("frames_minimum", 0), model_def.get("frames_steps", 1), model_def.get("fps", 16)],  # its first length and the steps after it
+                                "longest_frames": video.get("sliding_window_size") or (model_def.get("sliding_window_defaults") or {}).get("window_default"),  # the longest take of one window: past it, WanGP generates a second one
+                                "sliding_window": bool(model_def.get("sliding_window")),  # its model continues a take past one window
+                                "window_max": (model_def.get("sliding_window_defaults") or {}).get("window_max")})  # the longest one window can be
+        for task in EDIT_TASKS:  # Deepy's settings selected another editing model: a remake uses the first one made for it
+            entries = [entry for entry in catalog if entry["task"] == task]
+            if entries and not any(entry["default"] for entry in entries):
+                entries[0]["default"] = True
         return catalog
 
     def default_templates(self) -> dict:
@@ -120,6 +198,48 @@ class WanGPHost:
 
     def save_default_templates(self, picks: dict) -> None:
         self.plugin.save_config(templates=picks)
+
+    def prompt_rules(self) -> dict:
+        """The user's rules for writing prompts with a template ("category/name": text), for every production."""
+        return self.plugin.config().get("prompt_rules") or {}
+
+    def save_prompt_rules(self, rules: dict) -> None:
+        self.plugin.save_config(prompt_rules=rules)
+
+    def frame_size(self, entry: dict, resolution: str) -> str:
+        """The size a template's model makes of a resolution: fitted to its grid, as generation does."""
+        from shared import resolutions
+        return resolutions.align_resolution_value(resolution, (self.plugin.get_model_def(entry["model_type"]) or {}).get("vae_block_size", 16))
+
+    def settings(self) -> dict:
+        """Showrunner's own settings (its Settings screen), for every production."""
+        config = self.plugin.config()
+        return {"notify_turns": bool(config.get("notify_turns")), "cast_loras": bool(config.get("cast_loras")), "show_all_errors": bool(config.get("show_all_errors")), "show_deepy_tab": bool(config.get("show_deepy_tab")), "any_shot_length": bool(config.get("any_shot_length"))}
+
+    def save_settings(self, **fields) -> None:
+        self.plugin.save_config(**fields)
+
+    def notify(self, title: str, message: str) -> None:
+        """WanGP's notification sound on this computer, whatever it does for generations, at its volume, and its notification destinations when any is set."""
+        from shared.notifications import send_notification_async
+        from shared.utils.notification_sound import play_notification_async
+        config = self.plugin.server_config
+        play_notification_async(config.get("notification_sound_volume", 50))
+        send_notification_async(config, title, message)
+
+    def lora_folder(self, model_type: str) -> str | None:
+        """The LoRA folder of a model (None: it takes no LoRAs): a LoRA fits the models that share its folder."""
+        return None if (self.plugin.get_model_def(model_type) or {}).get("no_lora") else self._client().web_session().get_lora_dir(model_type)
+
+    def list_loras(self, model_type: str) -> list[str]:
+        return list(self._client().web_session().list_loras(model_type)["loras"])
+
+    def template_loras(self, template: str) -> tuple[list[str], str]:
+        """The LoRAs a Deepy template generates with, and their multipliers."""
+        from shared.mcp.server import _deepy_template_settings
+        task, _, name = template.partition("/")
+        settings = _deepy_template_settings(self._client().web_session(), task, name.strip() or "default")["settings"]
+        return list(settings.get("activated_loras") or []), str(settings.get("loras_multipliers") or "")
 
     def encode_settings(self):
         from shared.utils.audio_video import get_mp4_audio_codec_settings, get_video_audio_extra_args
@@ -136,7 +256,7 @@ class ShowrunnerPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.1.0"
+        self.version = "0.2.1"
         self.description = "Productions directed by Deepy: music videos, films, ads and stories, defined and reviewed shot by shot."
         self._showrunner = None
         self._lock = threading.Lock()
@@ -187,7 +307,7 @@ class ShowrunnerPlugin(WAN2GPPlugin):
     def create_ui(self):
         # data-src: WanGP's navigation loads the app when its tab is first shown and tells it when the tab is hidden.
         gr.HTML(f"""<div class="wangp-addon-web-view">
-  <iframe data-src=".{WEB_PATH}/?embedded=1" title="Showrunner" allow="fullscreen; clipboard-write" style="width:100%;height:calc(100vh - 150px);min-height:640px;border:0;border-radius:14px;background:#0b0d12"></iframe>
+  <iframe data-src=".{WEB_PATH}/?embedded=1" title="Showrunner" allow="fullscreen; clipboard-write" style="width:100%;height:calc(100vh - 150px);min-height:640px;border:0;background:#0b0d12"></iframe>
 </div>
 """, padding=False)
 

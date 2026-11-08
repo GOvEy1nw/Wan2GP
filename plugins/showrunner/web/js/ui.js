@@ -18,6 +18,7 @@ const ICONS = {
   plus: '<path d="M12 5v14M5 12h14"/>',
   upload: '<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
   download: '<path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 18v1a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1"/>',
+  settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
   play: '<path d="M7 4.5v15l13-7.5z" fill="currentColor"/>',
   pause: '<rect x="6" y="4.5" width="4" height="15" rx="1" fill="currentColor"/><rect x="14" y="4.5" width="4" height="15" rx="1" fill="currentColor"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>',
@@ -85,6 +86,57 @@ export function shotRefs(text, shots, cast = [], versions = []) {
     return index < 0 ? match : `<span class="shot-ref" title="${esc(shots[index].title || '')} (${match})">shot ${index + 1}</span>`;
   });
 }
+// "Mia, the lead singer": what the Add dialogs ask for, a name and a role.
+export function personFields(text) {
+  const [name, ...role] = text.trim().split(',');
+  return role.length ? { name: name.trim(), role: role.join(',').trim() } : { name: name.trim() };
+}
+
+// Deepy writes Markdown: the panel shows it as Deepy's own chat does (tables, lists, headings, bold, italics, code, links), raw HTML as text.
+// words(text) turns the plain words between the marks into HTML (shot and cast names); media(id) shows a Gallery media id (visual:…, audio:…).
+export function markdownHtml(text, words, media) {
+  const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n'), out = [], item = /^\s*([-*+]|\d+[.)])\s+/;
+  const cells = line => line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => mdSpan(cell.trim(), words, media));
+  let paragraph = [];
+  const flush = () => { if (paragraph.length) out.push(`<p>${paragraph.map(line => mdSpan(line, words, media)).join('<br>')}</p>`); paragraph = []; };
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (/^\s*```/.test(line)) {  // code, as it is
+      flush();
+      const code = [];
+      while (++index < lines.length && !/^\s*```/.test(lines[index])) code.push(lines[index]);
+      out.push(`<pre>${esc(code.join('\n'))}</pre>`);
+    } else if (line.includes('|') && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(lines[index + 1] || '')) {  // a table: its head, the rule under it, its rows
+      flush();
+      const head = cells(line), rows = [];
+      for (index += 2; index < lines.length && lines[index].includes('|'); index++) rows.push(cells(lines[index]));
+      index--;
+      out.push(`<div class="md-table"><table><thead><tr>${head.map(cell => `<th>${cell}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+    } else if (/^\s*#{1,6}\s+/.test(line)) {
+      flush();
+      out.push(`<p class="md-h">${mdSpan(line.replace(/^\s*#{1,6}\s+/, '').replace(/\s+#+\s*$/, ''), words, media)}</p>`);
+    } else if (item.test(line)) {  // a list, numbered or not
+      flush();
+      const numbered = /^\s*\d/.test(line), tag = numbered ? 'ol' : 'ul', items = [];
+      for (; index < lines.length && item.test(lines[index]) && /^\s*\d/.test(lines[index]) === numbered; index++) items.push(`<li>${mdSpan(lines[index].replace(item, ''), words, media)}</li>`);
+      index--;
+      out.push(`<${tag}>${items.join('')}</${tag}>`);
+    } else if (!line.trim() || /^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) flush();
+    else paragraph.push(line);
+  }
+  flush();
+  return out.join('');
+}
+const MEDIA_ID = /^(?:.*\/)?((?:visual|audio):[0-9a-f]{12})$/;  // an id, or a link to it (/wangp_api/gallery/media/visual:…)
+function mdSpan(text, words, media) {  // the marks of a line: code, pictures, links and media ids are set aside while its words become HTML
+  const kept = [], keep = html => `\u0000${kept.push(html) - 1}\u0000`, idOf = url => { try { return decodeURIComponent(url).match(MEDIA_ID)?.[1]; } catch { return null; } };
+  text = text.replace(/`([^`\n]+)`/g, (_, code) => keep(`<code>${esc(code)}</code>`))
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt, url) => keep(idOf(url) ? media(idOf(url)) : words(alt)))
+    .replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (_, label, url) => keep(idOf(url) ? media(idOf(url)) : /^https?:\/\//.test(url) ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>` : words(label)))
+    .replace(/\b(?:visual|audio):[0-9a-f]{12}\b/g, id => keep(media(id)));
+  return words(text).replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>').replace(/(^|[^*\w])\*([^*\s][^*\n]*)\*(?!\w)/g, '$1<i>$2</i>').replace(/\u0000(\d+)\u0000/g, (_, number) => kept[number]);
+}
+
 export function shotText(text, shots, cast = [], versions = []) {
   return versionRefs(text, versions).replace(/\b([sc])(\d+)\b/g, match => {
     if (match[0] === 'c') return cast.find(member => member.id === match)?.name || match;
@@ -133,6 +185,25 @@ export function formatDuration(seconds) {
   if (!seconds) return '0s';
   if (seconds < 60) return `${+seconds.toFixed(1)}s`;
   return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+}
+
+// The bar of a comparison player: it moves both videos together, to any moment of the longer one.
+export const COMPARE_SEEK = '<div class="compare-bar"><span class="mono" id="cmp-time">0:00</span><input type="range" id="cmp-seek" min="0" max="1000" value="0" aria-label="Move through both videos" title="Move through both videos"></div>';
+export function bindCompareSeek(root) {
+  const a = root.querySelector('#cmp-a'), b = root.querySelector('#cmp-b'), seek = root.querySelector('#cmp-seek'), time = root.querySelector('#cmp-time');
+  const length = () => Math.max(a.duration || 0, b.duration || 0);
+  let moving = false;
+  const show = () => {
+    if (!length()) return;
+    if (!moving) seek.value = Math.round(a.currentTime / length() * 1000);
+    time.textContent = `${formatTime(a.currentTime)} / ${formatTime(length())}`;
+  };
+  const jump = seconds => { a.currentTime = seconds; b.currentTime = seconds; show(); };
+  for (const video of [a, b]) video.addEventListener('loadedmetadata', show);
+  a.addEventListener('timeupdate', show);
+  seek.addEventListener('input', () => { moving = true; jump(seek.value / 1000 * length()); });
+  seek.addEventListener('change', () => { moving = false; });
+  return jump;
 }
 
 export function count(number, word) { return `${number} ${word}${number === 1 ? '' : 's'}`; }  // "1 shot", "3 shots"
@@ -211,9 +282,21 @@ export function confirmDialog({ title, text, ok = 'Confirm', danger = false }) {
   });
 }
 
-export function promptDialog({ title, text = '', value = '', placeholder = '', ok = 'Save', multiline = false }) {
+// A picture, video or sound shown over the page (the showrunner's conversation opens its media here): Esc or a click beside it closes it.
+export function mediaPopup({ kind, url, name = '' }) {
+  const media = kind === 'image' ? `<img src="${esc(url)}" alt="${esc(name)}">` : `<${kind} src="${esc(url)}" controls autoplay></${kind}>`;
+  const back = h(`<div class="modal-back"><div class="media-popup" role="dialog" aria-modal="true" aria-label="${esc(name)}">${media}${name ? `<div class="media-popup-name">${esc(name)}</div>` : ''}</div></div>`);
+  const close = () => { back.remove(); document.removeEventListener('keydown', keys); };
+  const keys = event => { if (event.key === 'Escape') { event.stopPropagation(); close(); } };
+  back.addEventListener('click', event => { if (event.target === back) close(); });
+  document.addEventListener('keydown', keys);
+  document.getElementById('overlay-root').append(back);
+}
+
+export function promptDialog({ title, text = '', value = '', placeholder = '', ok = 'Save', multiline = false, rows = 4, maxLength = 0 }) {
   return new Promise(resolve => {
-    const field = multiline ? `<textarea class="textarea" rows="4" placeholder="${esc(placeholder)}">${esc(value)}</textarea>` : `<input class="input" value="${esc(value)}" placeholder="${esc(placeholder)}">`;
+    const limit = maxLength ? ` maxlength="${maxLength}"` : '';
+    const field = multiline ? `<textarea class="textarea" rows="${rows}"${limit} placeholder="${esc(placeholder)}">${esc(value)}</textarea>` : `<input class="input"${limit} value="${esc(value)}" placeholder="${esc(placeholder)}">`;
     const back = h(`<div class="modal-back"><div class="modal" role="dialog" aria-modal="true"><h3>${esc(title)}</h3>${text ? `<p>${esc(text)}</p>` : ''}${field}
       <div class="actions"><button class="btn ghost" data-r="0">Cancel</button><button class="btn primary" data-r="1">${esc(ok)}</button></div></div></div>`);
     const input = back.querySelector('input,textarea');
@@ -227,9 +310,28 @@ export function promptDialog({ title, text = '', value = '', placeholder = '', o
 }
 
 let openMenu = null;
+// A button's attributes: greyed out with the reason it cannot be used now as its tooltip, or usable with its own tooltip.
+// What a local Deepy's settings cost a production: until closed, as long as it says the same.
+let closedAdvice = null;
+export function adviceBar(info) {
+  try { closedAdvice ??= localStorage.getItem('sr.advice'); } catch { /* a convenience */ }
+  return info?.advice && info.advice !== closedAdvice ? `<div class="next-step advice">${icon('alert')}<span class="grow">${esc(info.advice)}</span><button class="btn ghost icon" id="advice-close" title="Close" aria-label="Close">${icon('x')}</button></div>` : '';
+}
+export function bindAdvice(root, info) {
+  root.querySelector('#advice-close')?.addEventListener('click', () => {
+    closedAdvice = info.advice;
+    try { localStorage.setItem('sr.advice', info.advice); } catch { /* a convenience */ }
+    root.querySelector('.advice')?.remove();
+  });
+}
+
+export function availability(reason, title = '') {
+  return reason ? `disabled title="${esc(reason)}"` : title ? `title="${esc(title)}"` : '';
+}
+
 export function menu(anchor, items) {
   closeMenu();
-  const element = h(`<div class="menu" role="menu">${items.map((item, index) => item === '-' ? '<hr>' : `<button data-i="${index}" class="${item.danger ? 'danger' : ''}">${icon(item.icon || 'chevron')}<span>${esc(item.label)}</span></button>`).join('')}</div>`);
+  const element = h(`<div class="menu" role="menu">${items.map((item, index) => item === '-' ? '<hr>' : `<button data-i="${index}" class="${item.danger ? 'danger' : ''}" ${availability(item.unavailable)}>${icon(item.icon || 'chevron')}<span>${esc(item.label)}</span></button>`).join('')}</div>`);
   document.body.append(element);
   const rect = anchor instanceof Element ? anchor.getBoundingClientRect() : { left: anchor.x, right: anchor.x, top: anchor.y, bottom: anchor.y };
   const width = element.offsetWidth, height = element.offsetHeight;
@@ -316,6 +418,14 @@ function mergeFields(base, extra) {
   const merged = { ...base };
   for (const [key, value] of Object.entries(extra)) merged[key] = plain(value) && plain(base[key]) ? mergeFields(base[key], value) : value;
   return merged;
+}
+
+// At most one call per wait: the first at once, the last one asked for when the wait ends (live events come many times a second).
+export function throttle(fn, wait = 100) {
+  let timer = null, asked = false;
+  const run = () => { timer = null; if (asked) call(); };
+  const call = () => { asked = false; fn(); timer = setTimeout(run, wait); };
+  return () => { if (timer) asked = true; else call(); };
 }
 
 export function debounce(fn, wait = 250) {

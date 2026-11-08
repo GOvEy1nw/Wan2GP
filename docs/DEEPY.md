@@ -9,7 +9,7 @@ Use Deepy when you want to work toward an outcome instead of manually operating 
 ## Choose Deepy Zero or Deepy Prime
 
 - **Deepy Zero** is fast and lightweight. Use it for focused tasks such as generating one asset, editing selected media, extracting a clip, resizing a file, or producing a transcript. It works well with the smaller supported Qwen models.
-- **Deepy Prime** is for projects that need planning or several connected actions. Use it when Deepy must compare compatible models, combine multiple media assets, inspect intermediate results, manage project files, or work with external MCP services. Prime requires a local Qwen3.8 VL model (9B or 27B) or a configured remote LLM.
+- **Deepy Prime** is for projects that need planning or several connected actions. Use it when Deepy must compare compatible models, combine multiple media assets, inspect intermediate results, manage project files, or work with external MCP services. Prime requires a local Qwen3.8 VL model or a configured remote LLM.
 
 Both versions share generation features, galleries, media references, and saved sessions. Both offer a dedicated video-with-references template. Choose the assistant in **Configuration > Prompt Enhancer / Deepy**.
 
@@ -25,8 +25,8 @@ Supported local choices are:
 
 - `Qwen3.5VL Abliterated 4B`
 - `Qwen3.5VL Abliterated 9B`
-- `Qwen3.8VL Uncensored 9B` (supports local Deepy Prime)
 - `Qwen3.8VL Uncensored 27B` (supports local Deepy Prime)
+- `Qwen3.8VL Flash-Next 125B` (supports local Deepy Prime)
 
 For a remote Prime engine, see [Remote LLMs](REMOTE_LLMS.md). Once Deepy is enabled, **Ask Deepy** appears in the Gradio left dock. The CLI and standalone Web app use the same saved configuration.
 
@@ -207,6 +207,8 @@ The chat and generation progress bars show what Deepy and WanGP are doing.
 
 You can send a new instruction while Deepy is working. Use this to steer the current task, or queue the instruction for afterward when the interface offers that choice.
 
+Deepy's generations run after the current task and ahead of the tasks you added to the queue yourself, so a request to Deepy does not wait behind a long queue. Several of them run in the order Deepy requested them.
+
 **Compacted View of Thoughts and Actions** keeps long turns readable. A collapsed turn shows its latest useful statement, generated media, and final answer; expand it to review individual thoughts and actions. The preference is shared between Gradio and Web.
 
 ## Tool templates and defaults
@@ -254,8 +256,9 @@ Deepy uses **Video Generator with Ref.** when images or videos supply subject id
 
 WanGP includes built-in templates. To reuse your own model setup:
 
-1. Configure and save normal WanGP generation settings.
-2. Select that user settings file in WanGP's **Lora / Settings** dropdown.
+1. Configure normal WanGP generation settings.
+2. Save them as a preset: in the preset list at the top of the generator (beside **Apply** and **Save**), type a name, press **Save** and
+   confirm. Keep that preset selected.
 3. Open Deepy settings.
 4. Click **+** beside the Deepy tool that should use it.
 5. Confirm the link and save Deepy settings.
@@ -407,8 +410,8 @@ This selects the language and vision model that understands requests, plans work
 
 - **Qwen3.5VL Abliterated 4B** starts quickly and uses the least memory, but is less reliable with long instructions and multi-step decisions. **Recommended for:** Deepy Zero on limited hardware and simple, direct requests.
 - **Qwen3.5VL Abliterated 9B** understands more complex instructions and media better than 4B, with higher VRAM and RAM use. **Recommended for:** the best general Deepy Zero experience when it fits comfortably.
-- **Qwen3.8VL Uncensored 9B** runs local Deepy Prime in about 6.5 GB of VRAM with its default GGUF Q4_K_M, or about 11 GB with GGUF Q8_0, which stays closest to the full-precision model. It follows instructions and multi-step tool use about as well as the 27B and remembers earlier parts of long conversations reliably, but has less general knowledge, thinks longer before answering, and understands images less accurately than the 27B. **Recommended for:** local Prime on 8 to 12 GB GPUs.
-- **Qwen3.8VL Uncensored 27B** offers the strongest local planning, knowledge and image understanding for Deepy Prime, but needs considerably more memory and takes longer to load. **Recommended for:** local Prime and complex multimedia projects when it fits.
+- **Qwen3.8VL Uncensored 27B** offers the strongest local planning, knowledge and image understanding for Deepy Prime, but needs considerably more memory and takes longer to load. On GPUs with less than 16 GB of VRAM, choose its **Bonsai 2 PTQ1_0** quantization (see below), whose weights take less than 6 GB. **Recommended for:** local Prime and complex multimedia projects.
+- **Qwen3.8VL Flash-Next 125B** is much larger than the VRAM of a PC: it keeps in VRAM what the current conversation uses and leaves the rest in RAM and on the drive, so it stays usable on 12 GB GPUs and gets faster as a conversation goes on. It needs an 80 GB download on a fast SSD and about 64 GB of RAM: with less, it spends its time reading the drive. Long prompts take longer to read than with the 27B. **Recommended for:** local Prime on a PC with plenty of RAM, when you want the largest local model.
 - **A remote LLM** avoids loading the language model on the WanGP GPU and may provide stronger reasoning, but adds network latency and sends conversation content to the configured provider. Remote engines require Prime. **Recommended for:** Prime when local memory is insufficient or a supported remote engine is preferred. Review [Remote LLMs](REMOTE_LLMS.md) before using one with private media or instructions.
 
 Changing the engine can require new model downloads and a runtime reload.
@@ -426,7 +429,10 @@ For Qwen3.8 27B:
 
 - **GGUF Q4** has the highest quality and memory use. **Recommended for:** quality-first work when it fits without forcing excessive unloading. Usually this will require a 24 GB VRAM GPU.
 - **GGUF IQ3_S** is the middle ground for quality and memory. **Recommended for:** most local Prime installations. You may run this version with a 16 GB VRAM GPU.
-- **GGUF Q2** has the lowest memory use and the largest quality loss. **Recommended for:** this version can be also used with a 16 GB VRAM GPU but the advantage over Q3 is that you will be able to expand the context window.
+- **GGUF Q2** has lower memory use and a larger quality loss. **Recommended for:** this version can be also used with a 16 GB VRAM GPU but the advantage over Q3 is that you will be able to expand the context window.
+- **Bonsai 2 PTQ1_0** has the lowest memory use. **Recommended for:** GPUs with less than 16 GB of VRAM. It needs the GGUF kernels 1.0.22 or newer; without them, a first launch below 16 GB stays on Qwen3.5 4B and WanGP suggests Q2 if you choose Qwen3.8.
+
+On first launch, WanGP sets up Deepy Prime on the Qwen3.8 version that suits your NVIDIA GPU, with nothing to configure, so that Showrunner works right away: Q4 from 24 GB of VRAM, IQ3_S from 16 GB, Bonsai below that, with a 64K context from 10 GB of VRAM and 32K below. Settings you have already saved are never changed. You can pick another version, but if it is less compressed than the one suited to your GPU, or if a Speculative Decoding you chose pushes the model out of VRAM, WanGP warns you that Deepy may perform poorly: in **Configuration > Prompt Enhancer / Deepy**, at the first request of a Deepy chat, and in Showrunner. The same places tell you when Speculative Decoding is Disabled although your version of Qwen3.8 fits in VRAM with MTP on your GPU, as Deepy could then run about twice as fast.
 
 Deepy keeps as much of its local model in VRAM as fits beside its context cache. When the whole model does not fit, it streams the remaining layers from RAM at each step: it keeps working, but it answers more slowly the more layers are streamed, and it frees VRAM by itself when an image is inspected or another component needs memory. Deepy always uses the fastest kernels that are installed; there is no decoder setting to choose.
 
@@ -446,7 +452,7 @@ Speculative decoding can generate Deepy's text faster by predicting several toke
 
 Choose a method and **Number of Tokens** on the row above **KV Cache Quantization**. Only compatible methods appear; switching to an incompatible model or quantization resets the method to **Auto**.
 
-- **Auto** enables MTP on supported models when it speeds Deepy up: when the model fits in VRAM with it, or when part of the model has to stream from RAM anyway (MTP then predicts several tokens for each pass over the streamed weights). It stays off when MTP would push a model that otherwise fits in VRAM partly out of it, and on GPUs with 8 GB or less. For GGUF models, WanGP reads the checkpoint, context size and KV Cache Quantization to decide; for other quantizations Auto needs at least 12 GB for Qwen3.5 9B. The token count is automatic, and the console reports the choice Auto made.
+- **Auto** enables MTP on supported models when it speeds Deepy up: when the model fits in VRAM with it, or when part of the model has to stream from RAM anyway (MTP then predicts several tokens for each pass over the streamed weights). It stays off when MTP would push a model that otherwise fits in VRAM partly out of it, and on GPUs with 8 GB or less. From 13 to 16 GB, it enables MTP only when the whole model fits in VRAM with it. On Qwen3.8 27B, it uses 4 draft tokens from 24 GB of VRAM, or from 12 GB with Bonsai, and 2 below. For GGUF models, WanGP reads the checkpoint, context size and KV Cache Quantization to decide; for other quantizations Auto needs at least 12 GB for Qwen3.5 9B. The token count is automatic, and the console reports the choice Auto made.
 - **Disabled** adds no draft-model VRAM and disables the token control. Use it when memory is tight or prediction is slower for your workload.
 - **MTP** supports 1–8 draft tokens on Qwen3.5 9B and Qwen3.8/Bonsai 27B. Start with 2.
 - **DSpark** supports 1–7 draft tokens on Qwen3.8/Bonsai 27B when Triton and FlashAttention 2 are installed.
@@ -502,7 +508,7 @@ The context window is how much recent conversation, tool output, and project sta
 
 The KV cache holds the active conversation context in GPU memory. Quantizing it reduces that memory cost without changing the model checkpoint.
 
-- **Auto** uses fast INT8 caching when compatible GGUF kernels are installed and otherwise uses BF16. **Recommended for:** most users.
+- **Auto** chooses for your installation: Q4 when the GGUF and Triton kernels are installed and the GPU is an RTX 30XX or newer, fast INT8 with the GGUF kernels alone, and BF16 otherwise. **Recommended for:** most users.
 - **Disabled (BF16)** uses more VRAM and avoids cache quantization. **Recommended for:** quality-sensitive troubleshooting, or systems where INT8 cache performance is worse.
 - **INT8** uses about half the KV-cache VRAM and makes larger context windows practical. **Recommended for:** long Prime sessions or tight VRAM, provided the installed kernels support it efficiently.
 - **Below INT8** (INT8 keys with Q4 values, Q6, Q6 keys with Q4 values, Q4.1, Q4) shrinks the cache further, by a quarter to almost a half of the INT8 size. The first page of the conversation and the most recent tokens always stay in INT8; only the older middle of the context uses the smaller format. Q6 and INT8 keys with Q4 values are practically indistinguishable from INT8 on long texts; Q4.1 and Q4 cost a little precision on the oldest part of the context. Decoding speed is unchanged; reading a long prompt is 5 to 12 percent slower. **Recommended for:** very long Prime sessions on cards where the cache, not the model, is what no longer fits.
@@ -510,6 +516,14 @@ The KV cache holds the active conversation context in GPU memory. Quantizing it 
 **Exact Sink and Recent Tokens** appears with a cache below INT8 and chooses which tokens keep the INT8 precision: the first page plus the last 1024 tokens (recommended), the first page plus the last 256 tokens, the last 1024 tokens alone, or none for a uniformly quantized cache.
 
 The context-window label displays an estimated cache size. Treat that estimate as VRAM reserved before image or video model requirements.
+
+### KV Caches Kept in RAM
+
+When you go back to a conversation you left (your chat after a Showrunner request, or a production you worked on last), Deepy continues from its saved cache instead of rebuilding its context, so it answers in seconds rather than up to a minute. Each conversation keeps one cache, restored when it next needs Deepy; the oldest makes way once the limit is reached, and that conversation simply rebuilds its context on its next request.
+
+- **2** (default) keeps your chat and your last production ready.
+- **More** keeps more productions ready, at the cost of RAM: 64K tokens of context take about 1.2 GB in Q4, 2.1 GB in INT8 and 4 GB in BF16.
+- **Disabled** frees that RAM, and every conversation you come back to rebuilds its context. **Recommended for:** low RAM.
 
 ### Compaction Type When Context is Full
 
@@ -519,7 +533,14 @@ Compaction decides what happens when the live conversation no longer fits in the
 - **Summarize** condenses older work while preserving important goals, decisions, completed actions, file references, and next steps. It requires at least 32K context. **Recommended for:** most long sessions and all local Prime use.
 - **Summarize with Thinking** lets Deepy reason before creating the summary, improving preservation in complicated projects at the cost of more time and a minimum 48K context. **Recommended for:** long Prime workflows with many dependencies, not routine one-step requests.
 
-Summaries help but cannot guarantee perfect recall. Keep critical specifications in your request or in a workspace document when mistakes would be costly.
+Summaries help but cannot guarantee perfect recall. Keep critical specifications in your request (one longer than about a fifth of the context window is summarized too) or in a workspace document when mistakes would be costly.
+
+### Skip Low-Ranked Experts
+
+Available with Qwen3.8 Flash-Next. When enabled, the model leaves out the least important part of its work when that part is not already in graphics memory. Answers come faster, about 15-30% on a 32 GB card in our tests, and slightly less precise.
+
+- **Disabled** keeps full quality. **Recommended for:** careful work, where a precise answer matters more than speed.
+- **Enabled** favors speed. **Recommended for:** long answers and exploration, where you would rather have the text sooner.
 
 ### Repetition Penalty
 

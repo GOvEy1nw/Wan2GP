@@ -2,10 +2,13 @@
 """WanGP family handler for MiniMax H3."""
 
 import os
+import sys
 
 import gradio as gr
 import torch
+from tqdm import tqdm
 
+from shared.lora_paths import resolve_lora_dir
 from shared.utils.download import process_files_def_if_needed
 from shared.utils import files_locator as fl
 from shared.utils.hf import build_hf_url
@@ -14,16 +17,22 @@ from shared.utils.generation_overrides import get_override, set_override
 
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_EXCERPT_SETTINGS, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_CONTROL_LATENT_CONTINUATION, H3_MASK_MODE_DEFAULT, H3_MASK_MODE_GROUPED_ROWS,
-                        H3_MASK_MODE_SHARED_TIMESTEP, H3_MASK_MODE_SETTING, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT,
+                        H3_MASK_MODE_SHARED_TIMESTEP, H3_MASK_MODE_SETTING, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_LORA,
                         h3_grouped_masking_enabled)
 from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_DIALOGUE_PROMPT_INFOS, load_dialogue_whisper
 from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
                               VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
+from .p_h3_image import (P_H3_IMAGE_ARCHITECTURE, P_H3_IMAGE_FOLDER, P_H3_IMAGE_MAX_IMAGES, P_H3_IMAGE_REPO_ID, P_H3_IMAGE_STEPS, P_H3_IMAGE_SWITCH_THRESHOLD,
+                         P_H3_IMAGE_TEXT_ENCODER_BF16, P_H3_IMAGE_TEXT_ENCODER_FOLDER,
+                         P_H3_IMAGE_TEXT_ENCODER_INT8, P_H3_IMAGE_VAE_FILE, P_H3_IMAGE_VAE_INT8_FILE, query_p_h3_image_def)
+from .hyperflow import HYPERFLOW_DEFAULT_STEPS, HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT
 from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT
 from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_DEEPY_INFOS
 from .vae_upsampler import X2_VAE_DESCRIPTION, X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_METHOD, X2_VAE_VALUE, query_x2_vae_files
-from .viggle import VIGGLE_ARCHITECTURE, VIGGLE_ASSET_FOLDER, VIGGLE_INFOS, VIGGLE_PROMPT_FILE, VIGGLE_REPO_ID
+from .viggle import (VIGGLE_ARCHITECTURE, VIGGLE_ASSET_FOLDER, VIGGLE_INFOS, VIGGLE_PROMPT_FILE, VIGGLE_REMAKE_ARCHITECTURE, VIGGLE_REMAKE_DEEPY_INFOS, VIGGLE_REMAKE_DEEPY_PROMPT_INFOS,
+                     VIGGLE_REMAKE_ENHANCER_INSTRUCTIONS, VIGGLE_REMAKE_INFOS, VIGGLE_REMAKE_MAX_FRAMES, VIGGLE_REMAKE_MAX_PICTURES, VIGGLE_REMAKE_MIN_FRAMES, VIGGLE_REMAKE_OVERLAP, VIGGLE_REMAKE_PROMPT_INFOS,
+                     VIGGLE_REMAKE_SHIFT, VIGGLE_REMAKE_STEPS, VIGGLE_REPO_ID)
 from .prompt_enhancer import (FL2VA_DEEPY_PROMPT_INFOS, FL2VA_IMAGE_SYSTEM_PROMPT, FL2VA_PROMPT_INFOS, FL2VA_TEXT_SYSTEM_PROMPT,
                               H3_AUDIO_DEEPY_PROMPT_INFOS, H3_AUDIO_DIALOGUE_SYSTEM_PROMPT, H3_AUDIO_MONOLOGUE_SYSTEM_PROMPT,
                               H3_STILL_IMAGE_SYSTEM_PROMPT, H3_STILL_TEXT_SYSTEM_PROMPT,
@@ -40,10 +49,30 @@ TURBO_LORA_FILE = "minimax_h3_lightx2v_fl2v_turbo_4step_alpha16_v0.1.safetensors
 TURBO_LORA_KEY = "minimax_h3_lora_turbo"
 REF_TURBO_LORA_FILE = "minimax_h3_lightx2v_ref2v_turbo_4step_alpha8_v0.1_bf16.safetensors"
 REF_TURBO_LORA_KEY = "minimax_h3_ref_lora_turbo"
+REGENERATE_LORA_FP32_SIZE = 12_452_449_080  # the first, FP32 upload of the Regenerate 2K LoRA; its BF16 replacement keeps the name
+_fp32_regenerate_checked = False
+
+
+def _remove_fp32_regenerate_lora(lora_key):
+    """Once per session: delete a local copy of the FP32 Regenerate 2K LoRA, so that its BF16 version is downloaded in its place."""
+    global _fp32_regenerate_checked
+    wgp = sys.modules.get("wgp")
+    if _fp32_regenerate_checked or wgp is None:  # outside WanGP there is no LoRA folder to clean
+        return
+    _fp32_regenerate_checked = True
+    path = os.path.join(resolve_lora_dir(lora_key, wgp.get_lora_root(), wgp.args.lora_config), H3_REGENERATE_LORA)
+    if os.path.isfile(path) and os.path.getsize(path) == REGENERATE_LORA_FP32_SIZE:
+        os.remove(path)
+        tqdm.write(f"MiniMax H3: deleted the old FP32 Open-H3 Regenerate 2K LoRA '{path}' (12.5 GB). Its BF16 version (6.2 GB) will be downloaded the next time it is used.")
 TEXT_ENCODER_VARIANTS = {
     "gguf_q2_k": [TEXT_ENCODER_GGUF_Q2],
     "gguf_q4_k_m": [TEXT_ENCODER_GGUF_Q4],
     "nvfp4_awq": [TEXT_ENCODER_NVFP4],
+}
+DISTILLED_TEXT_ENCODER_CONFIG = {
+    "name": "Distilled Qwen3-VL-4B",
+    "text_encoder_folder": P_H3_IMAGE_TEXT_ENCODER_FOLDER,
+    "text_encoder_URLs": [build_hf_url(P_H3_IMAGE_REPO_ID, P_H3_IMAGE_TEXT_ENCODER_FOLDER, filename) for filename in (P_H3_IMAGE_TEXT_ENCODER_BF16, P_H3_IMAGE_TEXT_ENCODER_INT8)],
 }
 FL2VA_ARCHITECTURE = "minimax_h3_fl2va"
 FL2VA_PRUNED_ARCHITECTURE = "minimax_h3_fl2va_pruned"
@@ -285,7 +314,7 @@ PIKA_INFOS = """
 
 ### Pika H3 Flex
 
-Apply **Pika H3 Flex FL2VA 6 Steps** or **Pika H3 Flex Ref2VA 6 Steps** from the accelerator profiles for the matching model. FL2VA generates video and stereo audio from text, a first frame, a last frame, or both. Ref2VA uses image/video references and optional audio references; it requires at least one image or video.
+Apply **Pika H3 Flex FL2VA 6 Steps** or **Pika H3 Flex Ref2VA 6 Steps** from the accelerator profiles for the matching model. FL2VA generates video and stereo audio from text, a first frame, a last frame, or both. Ref2VA can generate from text alone or with injected frames. Image, video and audio references are optional.
 
 The profile selects **Pika Re-noise (6 Steps)**, six steps, flow shift 12 and one generation phase. Keep **Steps Skipping** off and **Custom Sigmas** empty. The sampler requires the matching Pika adapter; selecting it alone does not accelerate the base model. Use **Vanilla Phase 1 (Reset)** to return to ordinary H3 generation.
 
@@ -295,7 +324,7 @@ Start with 480p or 768p and a 5–15 second clip. These are Pika's released loca
 PIKA_DEEPY_INFOS = (" Pika H3 Flex accelerator profiles select the matching FL2VA/Ref2VA rank-128 adapter at multiplier 1, "
                    "sample_solver=pika_renoise, num_inference_steps=6, flow_shift=12, guidance_phases=1, custom_sigmas='', "
                    "skip_steps_cache_type=''. Use the profile, not the sampler alone. Start at 480p/768p and 124–362 frames at 24 fps. "
-                   "Ref2VA requires at least one image/video; up to 9 images, 3 videos and 3 standalone audio references, 12 files total. "
+                   "Ref2VA supports text alone or injected frames without additional references. It accepts up to 9 reference images, 3 videos and 3 standalone audio clips, with 12 reference files total. "
                    "Video soundtracks selected with audio_prompt_type=K stay attached to their videos. H3 reference order is images, videos, "
                    "then standalone audios; use <Picture N>, <Video N>, <Audio N> labels. Pika has no released local high-resolution or audio-stem stage. "
                    "Vanilla Phase 1 (Reset) restores Euler and removes accelerators while retaining additional LoRAs.")
@@ -321,6 +350,7 @@ H3_TEXT_ENCODER_INFOS = """Choose how much system RAM to use for interpreting pr
 - **Qwen3-VL Quanto INT8:** a balanced lower-memory choice.
 - **Qwen3-VL NVFP4 AWQ** and **Qwen3-VL GGUF Q4_K_M:** reduce memory further.
 - **Qwen3-VL GGUF Q2_K:** the most aggressive memory reduction.
+- **Distilled Qwen3-VL-4B:** a much smaller encoder trained to imitate the large one, for the least memory and the fastest prompts. It follows Text Encoder Quantization. It was made for still images: in video, spoken lines still work, but it can miss details of the prompt and may follow reference images and videos less closely. Prefer another choice when those matter.
 
 More aggressive quantization can slightly affect prompt interpretation.
 """
@@ -393,7 +423,22 @@ FASTH3_DEEPY_INFOS = ("Generate video and stereo sound in 8 steps (FastVideo Fas
                       "the Ref2VA base. `num_inference_steps` is locked to 8 with the Euler sampler; `flow_shift` defaults to 12 (the trained video shift). "
                       "Attention is locked to VSA sparse attention (Triton, NVIDIA SM80+). LoRAs trained for Ref2VA apply. Read `prompt_infos` for H3's structured prompt syntax.")
 
+HYPERFLOW_INFOS = """
+### HyperFlow H3 Flash — 4 to 8 steps
+
+HyperFlow H3 Flash is Video Rebirth's compressed, few-step MiniMax H3: about 14B parameters instead of 20B for the Pruned models, and no guidance pass.
+
+- **Steps:** choose **4** (fastest), **6** (default, balanced) or **8** (most detail). Other counts are not available: the model was trained on these three schedules. The sampler is Euler and the flow shift is fixed.
+- **One phase:** two-phase generation, custom sigmas, Audio Refinement and step skipping are not available.
+- **Speed and memory:** a step is slightly faster than a Pruned H3 step; most of the gain comes from the step count. At 6 steps denoising takes about a third less time than the 8-step PDD models, at 4 steps about half. Its 15 GB checkpoint needs less RAM than the 21 GB Pruned ones. **Sol-Attn** can be combined with it.
+- **LoRAs:** LoRAs made for the matching base model (FL2VA or Ref2VA) apply to the layers HyperFlow kept; their parts on the blocks it removed are skipped and their timestep part is approximated, so their effect can be weaker. Accelerator LoRAs (Turbo, PDD, Pika) are not needed: do not add them.
+"""
+HYPERFLOW_DEEPY_INFOS = (" HyperFlow H3 Flash (Video Rebirth's compressed few-step H3, 14B): `num_inference_steps` 4, 6 (default) or 8 only, Euler, `flow_shift` 12, "
+                         "one phase, empty `custom_sigmas`, no step skipping, no Audio Refinement. A step is slightly faster than Pruned: 6 steps take about a third "
+                         "less denoising time than 8-step PDD, 4 steps about half; 15 GB checkpoint. LoRAs for the matching base model apply partially (removed "
+                         "blocks skipped, timestep part approximated); never add accelerator LoRAs.")
 H3_RUNTIME_INFOS = H3_PHASE_INFOS + H3_PHASE_TURBO_INFOS + H3_AUDIO_REFINEMENT_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + H3_COMMON_RUNTIME_INFOS
+H3_HYPERFLOW_RUNTIME_INFOS = HYPERFLOW_INFOS.rstrip("\n") + H3_COMMON_RUNTIME_INFOS
 H3_PDD_RUNTIME_INFOS = PDD_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
 H3_FASTH3_RUNTIME_INFOS = FASTH3_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
 
@@ -524,6 +569,7 @@ def _get_audio_generator_model_def(model_def):
             "nvfp4_awq": {"name": "Qwen3-VL NVFP4 AWQ", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_NVFP4)]},
             "gguf_q4_k_m": {"name": "Qwen3-VL GGUF Q4_K_M", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_GGUF_Q4)]},
             "gguf_q2_k": {"name": "Qwen3-VL GGUF Q2_K", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_GGUF_Q2)]},
+            "distilled_4b": DISTILLED_TEXT_ENCODER_CONFIG,
         },
         "system_configs2": {
             "_name": "DiT Denoising Priority",
@@ -538,7 +584,7 @@ class family_handler:
     @staticmethod
     def query_supported_types():
         return [FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, CONTROL_ARCHITECTURE, CONTROL_PRUNED_ARCHITECTURE,
-                REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE]
+                REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE, VIGGLE_REMAKE_ARCHITECTURE, P_H3_IMAGE_ARCHITECTURE]
 
     @staticmethod
     def query_family_maps():
@@ -549,6 +595,7 @@ class family_handler:
             REF2VA_ARCHITECTURE: FL2VA_ARCHITECTURE,
             REF2VA_PRUNED_ARCHITECTURE: FL2VA_ARCHITECTURE,
             VIGGLE_ARCHITECTURE: FL2VA_ARCHITECTURE,
+            VIGGLE_REMAKE_ARCHITECTURE: FL2VA_ARCHITECTURE,
         }, {}
 
     @staticmethod
@@ -567,6 +614,7 @@ class family_handler:
 
     @staticmethod
     def get_lora_dir(base_model_type):
+        _remove_fp32_regenerate_lora("minimax_h3")
         return "minimax_h3"
 
     @staticmethod
@@ -578,11 +626,14 @@ class family_handler:
 
     @staticmethod
     def query_model_def(base_model_type, model_def):
+        if base_model_type == P_H3_IMAGE_ARCHITECTURE:  # phase 2 adds the FL2VA Turbo when no accelerator has a phase-2 multiplier
+            return {**query_p_h3_image_def(H3_DENOISING_PRIORITY_INFOS), TURBO_LORA_KEY: build_hf_url(REPO_ID, "loras", TURBO_LORA_FILE)}
         if base_model_type == VIGGLE_ARCHITECTURE:
             result = family_handler.query_model_def(REF2VA_PRUNED_ARCHITECTURE, model_def)
             result.pop("resolution_budget_tiled", None)
             result.update({
                 "profiles_dir": [VIGGLE_ARCHITECTURE],
+                "spoken_line_prompt": None,  # its prompt is fixed
                 "device_explicit": True,
                 "specialities": [{"name": "character replacement"}, {"name": "motion transfer"}],
                 "infos": VIGGLE_INFOS,
@@ -610,6 +661,50 @@ class family_handler:
                     "labels": {"": "No Input Audio", "A": "Use Custom Audio", "K": "Reuse Control Video Audio"},
                     "letters_filter": "AK", "label": "Control Audio", "show_label": True, "default": "",
                 },
+            })
+            return result
+        if base_model_type == VIGGLE_REMAKE_ARCHITECTURE:
+            mode = model_def.get("viggle_remake_mode", "swap")
+            result = family_handler.query_model_def(REF2VA_PRUNED_ARCHITECTURE, model_def)
+            result.pop("resolution_budget_tiled", None)
+            for key in ("text_prompt_enhancer_instructions1", "image_prompt_enhancer_instructions1", "text_prompt_enhancer_max_tokens1", "image_prompt_enhancer_max_tokens1", "preset_profiles_dir"):
+                result.pop(key, None)
+            result.update({
+                "profiles_dir": [],
+                "accelerated": "native",
+                "spoken_line_prompt": None,  # the soundtrack is the source's
+                "specialities": [{"name": "character replacement", "aliases": ["recasting", "person swap"], "description": "Recasts the people of a video from painted frames, keeping motion, camera, timing and soundtrack."}]
+                                if mode == "swap" else
+                                [{"name": "video object and scene editing", "aliases": ["object removal", "background replacement", "weather change"], "description": "Removes, replaces or adds objects and changes setting, weather or light from painted frames, keeping people and motion."}],
+                "video_edit": {"kind": mode, "input": "painted_frames", "pins": True, "max_images": VIGGLE_REMAKE_MAX_PICTURES, "continuation_overlap": VIGGLE_REMAKE_OVERLAP},
+                "infos": VIGGLE_REMAKE_INFOS[mode],
+                "prompt_infos": VIGGLE_REMAKE_PROMPT_INFOS,
+                "deepy_infos": VIGGLE_REMAKE_DEEPY_INFOS[mode],
+                "deepy_prompt_infos": VIGGLE_REMAKE_DEEPY_PROMPT_INFOS,
+                "prompt_enhancer_def": {"selection": ["TI"], "labels": {"TIV": "A Remake Prompt from Text + {image_inputs}"}, "default": ""},  # it cannot see the source video: without the painted frames it invents what they show
+                "text_prompt_enhancer_instructions": VIGGLE_REMAKE_ENHANCER_INSTRUCTIONS[mode],
+                "video_prompt_enhancer_instructions": VIGGLE_REMAKE_ENHANCER_INSTRUCTIONS[mode],
+                "text_prompt_enhancer_max_tokens": 2048,
+                "video_prompt_enhancer_max_tokens": 2048,
+                "image_outputs": False, "v2i_switch_supported": False, "sliding_window": True, "video_continuation": False,
+                "resolution_budget": "1280x736",
+                "frames_minimum": VIGGLE_REMAKE_MIN_FRAMES,
+                "sliding_window_defaults": {"window_min": VIGGLE_REMAKE_MIN_FRAMES, "window_max": VIGGLE_REMAKE_MAX_FRAMES, "window_step": 17, "window_default": 294,
+                                            "overlap_min": VIGGLE_REMAKE_OVERLAP, "overlap_max": 119, "overlap_step": 17, "overlap_offset": 0, "overlap_default": VIGGLE_REMAKE_OVERLAP, "discard_step": 1},
+                "extract_guide_from_window_start": True, "control_video_trim_disabled": False, "control_video_trim": False,
+                "image_prompt_types_allowed": "T", "end_frames_always_enabled": False, "image_end_frame_position": False,
+                "guidance_max_phases": 1, "lock_guidance_phases": True, "lora_multiplier_phases": 1,
+                "phase_2_spatial_tiling": False, "inference_steps2": False, "lock_inference_steps": True, "flow_shift": False, "custom_sigmas": False, "custom_settings": [], "sample_solvers": [("Euler", "euler")],
+                "spectrum_cache": False, "first_block_cache": False,
+                "no_background_removal": True, "any_image_refs_relative_size": False, "fit_into_canvas_image_refs": 1,
+                "image_ref_choices": {"choices": [("Use Painted Frames for the Look", "I"), ("Pin Painted Frames at Chosen Positions", "FI")], "letters_filter": "FI", "default": "I", "label": "Painted Frames"},
+                "guide_custom_choices": {"choices": [("Use Source Video", "VU"), ("Use Source Video with a Mask", "VA")], "letters_filter": "V-UA", "default": "VU", "label": "Source Video"},
+                "mask_preprocessing": None, "video_mask_label": "Video Mask (white = what may change, black = kept exactly)",
+                "video_guide_label": "Source Video", "preprocess_video_guide2": False, "reference_video_enabled": False, "reference_image_enabled": False,
+                "any_audio_prompt": True, "audio_prompt_choices": True, "output_audio_is_input_audio": True, "audio_tail_ms": 0,
+                "audio_guide_label": "Custom Soundtrack",
+                "audio_prompt_type_sources": {"selection": ["K", "A"], "labels": {"K": "Keep the Source Video's Soundtrack", "A": "Use Custom Soundtrack"},
+                                              "letters_filter": "AK", "label": "Soundtrack", "show_label": True, "default": "K"},
             })
             return result
         if base_model_type in CONTROL_ARCHITECTURES:
@@ -657,7 +752,10 @@ class family_handler:
         fasth3 = model_def.get("fasth3", False)
         if fasth3 and not (reference_mode and pdd):
             raise ValueError("FastH3 Omni is a Ref2VA PDD student: declare it on the Ref2VA architecture with pdd")
-        fixed_schedule = pdd or fasth3
+        hyperflow = model_def.get("hyperflow", False)
+        if hyperflow and (not pruned or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3"))):
+            raise ValueError("HyperFlow H3 Flash is declared on the pruned FL2VA or Ref2VA architecture, without other acceleration flags")
+        fixed_schedule = pdd or fasth3 or hyperflow
         pika_supported = not (fixed_schedule or ptd or vdn or veda)
         text_encoder_variant = model_def.get("text_encoder_variant")
         text_encoder_files = [TEXT_ENCODER_BF16, TEXT_ENCODER_INT8] if text_encoder_variant is None else TEXT_ENCODER_VARIANTS[text_encoder_variant]
@@ -668,7 +766,7 @@ class family_handler:
             "uint8_guides": _uint8_guides,
             "tiny_vae_architecture": REF2VA_ARCHITECTURE,
             "size": "lighter" if pruned else "large",
-            **({"accelerated": "native"} if pdd or vdn or veda or fasth3 else {}),
+            **({"accelerated": "native"} if pdd or vdn or veda or fasth3 or hyperflow else {}),
             **({"specialities": [{"name": "character consistency", "aliases": ["identity preservation"]}, {"name": "motion transfer", "description": "Transfer motion or camera from reference videos to image-reference characters."}]} if reference_mode else {}),
             "fps": 24,
             "v2i_switch_supported": True,
@@ -719,10 +817,10 @@ class family_handler:
             },
             "inference_steps": True,
             "inference_steps2": not fixed_schedule,
-            "lock_inference_steps": fixed_schedule,
-            "flow_shift": True,
-            "spectrum_cache": True,
-            "first_block_cache": True,
+            "lock_inference_steps": pdd or fasth3,
+            "flow_shift": not hyperflow,
+            "spectrum_cache": not hyperflow,
+            "first_block_cache": not hyperflow,
             "skip_steps_multiplier_choices": FIRST_BLOCK_CACHE_STRENGTHS,
             "skip_steps_multiplier_label": "First Block Cache Threshold",
             "first_block_cache_thresholds": FIRST_BLOCK_CACHE_THRESHOLDS,
@@ -746,6 +844,7 @@ class family_handler:
             "sample_solvers": [("Euler", "euler")] if fixed_schedule else [("Euler", "euler"), ("RES Multistep", "res_multistep"), ("Ralston 2S (~2x slower)", "ralston_2s")] + ([("Pika Re-noise (6 Steps)", PIKA_SOLVER)] if pika_supported else []),
             "no_negative_prompt": True,
             "returns_audio": True,
+            "spoken_line_prompt": {"line": "{speaker}{note} says ({id}) <d>[{language}] {line}</d>", "before": "overall_soundscape:"},  # a line for H3 to voice, and the section of a structured prompt it goes before
             "audio_window_alignment": True,
             "audio_overlap_repair_ms": 25,  # sources without an audio tail: one audio latent, plus the measured waveform shortfall
             "audio_tail_ms": 100,  # generate() returns audio running past the last frame (H3_AUDIO_TAIL_LATENTS)
@@ -755,7 +854,8 @@ class family_handler:
             "control_video_trim_disabled": True,
             "extract_guide_from_window_start": True,  # sliding windows get pure window-aligned guide frames; continuation comes through input_video
             "prompt_enhancer_picture_labels": True,  # enhancer images are labelled with the <Picture N> the pipeline presents
-            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_RUNTIME_INFOS)) + (PRUNED_INFOS if pruned else "") + (H3_VDN_INFOS if vdn else "") + model_def.get("infos", ""),
+            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_HYPERFLOW_RUNTIME_INFOS if hyperflow else H3_RUNTIME_INFOS))
+                     + (PRUNED_INFOS if pruned and not hyperflow else "") + (H3_VDN_INFOS if vdn else "") + model_def.get("infos", ""),
             "prompt_infos": REF2VA_PROMPT_INFOS if reference_mode else FL2VA_PROMPT_INFOS,
             "prompt_enhancer_button_label": "Write",
             "prompt_enhancer_def": {
@@ -776,7 +876,7 @@ class family_handler:
             "image_prompt_enhancer_instructions1": H3_STILL_IMAGE_SYSTEM_PROMPT,
             "text_prompt_enhancer_max_tokens1": 1024,
             "image_prompt_enhancer_max_tokens1": 1024,
-            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
+            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else ["minimax_h3_hyperflow"] if hyperflow else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
             "preset_profiles_dir": [] if fixed_schedule or vdn else ["minimax_h3_presets"],
             "finetune_custom_urls": ["video_vae_file", "audio_vae_file"],
             "vae_upsamplers": {X2_VAE_METHOD: [0, 1, 2]},
@@ -797,6 +897,7 @@ class family_handler:
                 "nvfp4_awq": {"name": "Qwen3-VL NVFP4 AWQ", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_NVFP4)]},
                 "gguf_q4_k_m": {"name": "Qwen3-VL GGUF Q4_K_M", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_GGUF_Q4)]},
                 "gguf_q2_k": {"name": "Qwen3-VL GGUF Q2_K", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_GGUF_Q2)]},
+                "distilled_4b": DISTILLED_TEXT_ENCODER_CONFIG,
             },
             "system_configs2": {
                 "_name": "Video VAE",
@@ -815,7 +916,7 @@ class family_handler:
                 "lower_ram": {"name": "Lower RAM", "qkv_splitting": False},
             },
         }
-        if pdd:
+        if pdd or hyperflow:
             result["custom_settings"] = result["custom_settings"][:1]
         if reference_mode:
             result.update({
@@ -947,6 +1048,8 @@ class family_handler:
             result["deepy_infos"] = FASTH3_DEEPY_INFOS
         if pdd:
             result["deepy_infos"] += " PDD requires exactly 8 inference steps and the Euler sampler. LoRAs trained for the matching base model apply."
+        elif hyperflow:
+            result["deepy_infos"] += HYPERFLOW_DEEPY_INFOS
         else:
             result["deepy_infos"] += " Two-phase generation uses `num_inference_steps2` (default 3) for final enhancement and `switch_threshold` for its starting noise. Accelerator LoRAs before `|` with any nonzero phase-2 multiplier replace the automatic Turbo together, at their specified multipliers; if all are zero, the automatic Turbo is used. `1;0` means phase 1 only, `1;0.6` sets phase 2 to 0.6, and `1` applies to both phases. LoRAs after `|` keep their multipliers."
         if vdn:
@@ -983,9 +1086,43 @@ class family_handler:
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
+        if base_model_type == P_H3_IMAGE_ARCHITECTURE:
+            if len(inputs["image_refs"] or []) > P_H3_IMAGE_MAX_IMAGES:
+                return f"P-H3-Image edits with at most {P_H3_IMAGE_MAX_IMAGES} images"
+            if inputs["sample_solver"] != "euler":
+                return "P-H3-Image requires the Euler sampler"
+            return None
+        if base_model_type == VIGGLE_REMAKE_ARCHITECTURE:
+            if inputs["video_guide"] is None:
+                return "Viggle Remake requires a Source Video"
+            if "A" in inputs["video_prompt_type"] and "U" in inputs["video_prompt_type"]:
+                return "Viggle Remake takes a Video Mask with `VA` in place of `VU`"
+            image_count = len(inputs["image_refs"] or [])
+            if not 1 <= image_count <= VIGGLE_REMAKE_MAX_PICTURES:
+                return f"Viggle Remake takes 1 to {VIGGLE_REMAKE_MAX_PICTURES} painted frames (found {image_count})"
+            if "F" in inputs["video_prompt_type"]:
+                positions = [position for position in (inputs["frames_positions"] or "").replace(",", " ").split() if position.upper() != "X"]
+                if len(positions) != image_count:
+                    return f"Viggle Remake pins one frame position per painted frame (found {len(positions)} positions and {image_count} frames)"
+                if any(not position.isdigit() for position in positions) or [int(position) for position in positions] != sorted(int(position) for position in positions):
+                    return "Viggle Remake frame positions must be frame numbers in ascending order, in the order of the painted frames"
+            window = inputs["sliding_window_size"]
+            if not VIGGLE_REMAKE_MIN_FRAMES <= window <= VIGGLE_REMAKE_MAX_FRAMES:
+                return f"Viggle Remake windows run {VIGGLE_REMAKE_MIN_FRAMES} to {VIGGLE_REMAKE_MAX_FRAMES} frames"
+            inputs.update({"num_inference_steps": VIGGLE_REMAKE_STEPS, "flow_shift": VIGGLE_REMAKE_SHIFT, "guidance_scale": 1.0, "guidance_phases": 1, "sample_solver": "euler", "custom_sigmas": "", "skip_steps_cache_type": ""})
+            inputs["sliding_window_overlap"] = normalize_overlap(int(inputs["sliding_window_overlap"] or VIGGLE_REMAKE_OVERLAP), 17, 0)[0]
+            if "K" in inputs["audio_prompt_type"]:
+                from shared.utils.audio_video import extract_audio_tracks
+
+                try:
+                    if extract_audio_tracks(inputs["video_guide"], query_only=True) == 0:
+                        inputs["audio_prompt_type"] = inputs["audio_prompt_type"].replace("K", "")  # a silent source gives a silent result
+                except Exception as error:
+                    return f"Unable to inspect the Source Video's soundtrack: {error}"
+            return None
         pika = inputs["sample_solver"] == PIKA_SOLVER
         if pika:
-            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3")):
+            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow")):
                 return "Pika H3 Flex requires a standard FL2VA or Ref2VA model"
             if inputs["num_inference_steps"] != PIKA_STEPS or inputs["flow_shift"] != PIKA_VIDEO_SHIFT or inputs["guidance_phases"] != 1:
                 return "Pika H3 Flex requires 6 steps, flow shift 12 and one generation phase; apply its matching accelerator profile"
@@ -1049,6 +1186,12 @@ class family_handler:
             if inputs["sample_solver"] != "euler":
                 return "MiniMax H3 PDD requires the Euler sampler"
             inputs["num_inference_steps"] = required_steps
+        if model_def.get("hyperflow", False):
+            if inputs["num_inference_steps"] not in HYPERFLOW_STEPS:
+                return f"HyperFlow H3 Flash runs {', '.join(map(str, HYPERFLOW_STEPS[:-1]))} or {HYPERFLOW_STEPS[-1]} inference steps"
+            if inputs["sample_solver"] != "euler":
+                return "HyperFlow H3 Flash requires the Euler sampler"
+            inputs.update({"flow_shift": HYPERFLOW_VIDEO_SHIFT, "guidance_scale": 1.0, "guidance_phases": 1, "custom_sigmas": "", "skip_steps_cache_type": ""})
         overlap, error = normalize_overlap(int(inputs["sliding_window_overlap"] or 0), 17, 5 if H3_CONTROL_LATENT_CONTINUATION and base_model_type in CONTROL_ARCHITECTURES else 1)
         if error:
             return error
@@ -1207,8 +1350,6 @@ class family_handler:
             return "MiniMax H3 accepts at most 3 audio references"
         _notify_audio_reference_limit(audio_durations)
         visual_count = image_count + len(video_durations)
-        if pika and not visual_count:
-            return "Pika H3 Flex Ref2VA requires at least one image or video reference"
         if not pika and audio_count > visual_count:
             return f"MiniMax H3 requires at least as many reference images and videos as audio references (found {visual_count} visual and {audio_count} audio)"
         file_count = image_count + len(videos) + (0 if soundtrack_mode else audio_count)
@@ -1219,13 +1360,28 @@ class family_handler:
     @staticmethod
     def resolve_runtime_model_def(model_def, runtime_context):
         """Resolve Auto once for both asset downloads and model loading."""
-        if "video_vae_file" in model_def or model_def.get("system_configs2", {}).get("_name") != "Video VAE":
+        if "video_vae_file" in model_def or model_def.get("system_configs2", {}).get("_name") not in ("Video VAE", "VAE"):
             return model_def
+        if model_def["system_configs2"]["_name"] == "VAE":  # P-H3-Image
+            return {**model_def, "video_vae_file": P_H3_IMAGE_VAE_INT8_FILE if runtime_context["transformer_quantization"] == "int8" else P_H3_IMAGE_VAE_FILE}
         filename = {"int8": VIDEO_VAE_INT8_FILE, "fp8": VIDEO_VAE_FP8MIX_FILE}.get(runtime_context["transformer_quantization"], VIDEO_VAE_FILE)
         return {**model_def, "video_vae_file": filename, "x2_vae_file": X2_VAE_INT8_FILE if filename == VIDEO_VAE_INT8_FILE else X2_VAE_FILE}
 
     @staticmethod
+    def query_retired_files(model_type):
+        """Checkpoints that earlier releases of a model type downloaded and its current definition no longer names (Models Manager
+        lists them with the model, to delete them)."""
+        return {
+            "minimax_h3_fl2va_pruned": ["MiniMax-H3-FL2VA-pruned_bf16.safetensors", "MiniMax-H3-FL2VA-pruned_int8_convrot.safetensors"],
+            "minimax_h3_ref2va_pruned": ["MiniMax-H3-Ref2VA-pruned_bf16.safetensors", "MiniMax-H3-Ref2VA-pruned_int8_convrot.safetensors"],
+        }.get(model_type, [])
+
+    @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
+        if base_model_type == P_H3_IMAGE_ARCHITECTURE:
+            vae_file = model_def.get("video_vae_file", P_H3_IMAGE_VAE_FILE)
+            return [{"repoId": P_H3_IMAGE_REPO_ID, "sourceFolderList": [P_H3_IMAGE_FOLDER, P_H3_IMAGE_TEXT_ENCODER_FOLDER],
+                     "fileList": [[vae_file.rsplit("/", 1)[-1]], ["config.json", "tokenizer.json", "tokenizer_config.json"]]}]
         source_folders = []
         file_lists = []
         if model_def.get("ptd", False):
@@ -1243,16 +1399,21 @@ class family_handler:
         if vae_files:
             source_folders.append("")
             file_lists.append(vae_files)
+        distilled_text_encoder = model_def.get("text_encoder_folder") == P_H3_IMAGE_TEXT_ENCODER_FOLDER
         if base_model_type != VIGGLE_ARCHITECTURE:
-            source_folders.append(TEXT_ENCODER_FOLDER)
-            file_lists.append(["config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json", "vocab.json"])
-            source_folders.append(LATENT_UPSCALER_FOLDER)
-            file_lists.append([LATENT_UPSCALER_FILE])
+            if not distilled_text_encoder:
+                source_folders.append(TEXT_ENCODER_FOLDER)
+                file_lists.append(["config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json", "vocab.json"])
+            if base_model_type != VIGGLE_REMAKE_ARCHITECTURE:
+                source_folders.append(LATENT_UPSCALER_FOLDER)
+                file_lists.append([LATENT_UPSCALER_FILE])
         downloads = [{
             "repoId": REPO_ID,
             "sourceFolderList": source_folders,
             "fileList": file_lists,
         }]
+        if distilled_text_encoder:
+            downloads.append({"repoId": P_H3_IMAGE_REPO_ID, "sourceFolderList": [P_H3_IMAGE_TEXT_ENCODER_FOLDER], "fileList": [["config.json", "tokenizer.json", "tokenizer_config.json"]]})
         if video_vae_file in (X2_VAE_FILE, X2_VAE_INT8_FILE):
             downloads.append(query_x2_vae_files(video_vae_file))
         if base_model_type == VIGGLE_ARCHITECTURE:
@@ -1273,15 +1434,18 @@ class family_handler:
 
         pdd = model_def.get("pdd", False)
         viggle = base_model_type == VIGGLE_ARCHITECTURE
+        remake_mode = model_def.get("viggle_remake_mode", "swap") if base_model_type == VIGGLE_REMAKE_ARCHITECTURE else None
+        image_model = base_model_type == P_H3_IMAGE_ARCHITECTURE
+        distilled_text_encoder = model_def.get("text_encoder_folder") == P_H3_IMAGE_TEXT_ENCODER_FOLDER
         if model_def.get("ptd", False):
             model_filename = list(model_filename) if isinstance(model_filename, (list, tuple)) else [model_filename]
             model_filename.append(fl.locate_file(os.path.join(PTD_FOLDER, PTD_HEAD_FILE)))
-        video_vae_file = model_def.get("video_vae_file", VIDEO_VAE_FILE)
+        video_vae_file = model_def.get("video_vae_file", P_H3_IMAGE_VAE_FILE if image_model else VIDEO_VAE_FILE)
         if VAE_upsampling == X2_VAE_VALUE:  # the X2 decoder of the selected Video VAE replaces it; downloaded once both choices are known
             video_vae_file = model_def.get("x2_vae_file", X2_VAE_FILE)
             process_files_def_if_needed(query_x2_vae_files(video_vae_file), status_text="Downloading MiniMax H3 X2 VAE")
         pipeline = model_factory(model_filename, text_encoder_filename, dtype=dtype,
-                                 reference_mode=base_model_type in (REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE),
+                                 reference_mode=base_model_type in (REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE, VIGGLE_REMAKE_ARCHITECTURE, P_H3_IMAGE_ARCHITECTURE),
                                  save_quantized=save_quantized, model_type=model_type,
                                  qkv_splitting=model_def["qkv_splitting"],
                                  qkv_layout=model_def["qkv_layout"],
@@ -1290,9 +1454,14 @@ class family_handler:
                                  pdd=pdd, pdd_num_steps=PDD_NUM_STEPS if pdd else None, pdd_block_size=PDD_BLOCK_SIZE if pdd else None,
                                  vdn=model_def.get("vdn", False), veda=model_def.get("veda", False), vsa=model_def.get("fasth3", False),
                                  audio_only=base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE,
-                                 fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None)
+                                 fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None,
+                                 image_model=image_model, distilled_text_encoder=distilled_text_encoder, remake_mode=remake_mode)
         pipeline.ptd = model_def.get("ptd", False)
         pipe = {"transformer": pipeline.transformer}
+        if image_model:
+            pipe.update({"vae": pipeline.video_decoder, "video_encoder": pipeline.video_encoder, "text_encoder": pipeline.text_encoder.language_model,
+                         "vision_encoder": pipeline.text_encoder.visual, "text_connector": pipeline.text_encoder.text_connector, "latent_upscaler": pipeline.latent_upscaler})
+            return pipeline, {"pipe": pipe, "pinnedMemory": False} if disable_pinning else pipe
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE and H3_DIALOGUE_GENERATION:
             pipeline.dialogue_whisper = load_dialogue_whisper()
             pipe["dialogue_whisper"] = pipeline.dialogue_whisper
@@ -1304,12 +1473,16 @@ class family_handler:
             })
             if not viggle:
                 pipe.update({"text_encoder": pipeline.text_encoder.language_model, "vision_encoder": pipeline.text_encoder.visual,
-                             "latent_upscaler": pipeline.latent_upscaler})
+                             **({} if remake_mode else {"latent_upscaler": pipeline.latent_upscaler})})
+                if distilled_text_encoder:
+                    pipe["text_connector"] = pipeline.text_encoder.text_connector
         else:
             class BorrowingPipe(dict):
                 pass
 
             borrowed_names = ("text_encoder", "vision_encoder", "vae", "video_encoder", "audio_vae", "latent_upscaler")
+            if "text_connector" in shared_h3_offloadobj.models:
+                borrowed_names += ("text_connector",)
             pipe = BorrowingPipe(pipe)
             pipe.update({name: shared_h3_offloadobj.models[name] for name in borrowed_names})
             pipe._mmgp_ignore_models = borrowed_names
@@ -1326,7 +1499,7 @@ class family_handler:
             ui_defaults["overrides"] = set_override(ui_defaults.get("overrides", ""), "attention_mode", "vsa")
         elif get_override(ui_defaults.get("overrides", ""), "attention_mode") == "vsa":
             ui_defaults["overrides"] = set_override(ui_defaults["overrides"], "attention_mode", "")
-        if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE:
+        if base_model_type in (TTS_REF2VA_PRUNED_ARCHITECTURE, P_H3_IMAGE_ARCHITECTURE):
             return
         if base_model_type in CONTROL_ARCHITECTURES:
             # The former VU/UV outpainting choice is now V plus the existing spatial-outpainting settings.
@@ -1374,10 +1547,20 @@ class family_handler:
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):
         ui_defaults.pop("input_video_strength", None)
+        if base_model_type == P_H3_IMAGE_ARCHITECTURE:
+            ui_defaults.update({"image_mode": 1, "resolution": "2912x2912", "num_inference_steps": P_H3_IMAGE_STEPS, "num_inference_steps2": 3, "guidance_phases": 1,
+                                "switch_threshold": P_H3_IMAGE_SWITCH_THRESHOLD, "custom_sigmas": "", "guidance_scale": 1.0, "sample_solver": "euler", "flow_shift": 12.0,
+                                "video_prompt_type": "", "audio_prompt_type": "", "prompt_enhancer": "", "batch_size": 1})
+            return
         if base_model_type == VIGGLE_ARCHITECTURE:
             family_handler.update_default_settings(REF2VA_PRUNED_ARCHITECTURE, model_def, ui_defaults)
             ui_defaults.update({"num_inference_steps": 3, "flow_shift": 3.0, "video_prompt_type": "IVU",
                                 "sliding_window_size": 124, "sliding_window_overlap": 18, "prompt_enhancer": ""})
+            return
+        if base_model_type == VIGGLE_REMAKE_ARCHITECTURE:
+            family_handler.update_default_settings(REF2VA_PRUNED_ARCHITECTURE, model_def, ui_defaults)
+            ui_defaults.update({"num_inference_steps": VIGGLE_REMAKE_STEPS, "flow_shift": VIGGLE_REMAKE_SHIFT, "guidance_scale": 1.0, "guidance_phases": 1, "sample_solver": "euler", "video_prompt_type": "IVU", "audio_prompt_type": "K",
+                                "resolution": "832x480", "video_length": 124, "sliding_window_size": 294, "sliding_window_overlap": VIGGLE_REMAKE_OVERLAP, "prompt_enhancer": "", "custom_sigmas": ""})
             return
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE:
             ui_defaults.update({
@@ -1422,5 +1605,7 @@ class family_handler:
             ui_defaults.update({"num_inference_steps": 8, "video_prompt_type": "I", "prompt_enhancer": "", "skip_steps_cache_type": ""})
         if model_def.get("fasth3", False):
             ui_defaults.update({"num_inference_steps": FASTH3_STEPS, "flow_shift": FASTH3_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
+        if model_def.get("hyperflow", False):
+            ui_defaults.update({"num_inference_steps": HYPERFLOW_DEFAULT_STEPS, "flow_shift": HYPERFLOW_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
         if base_model_type in CONTROL_ARCHITECTURES:
             ui_defaults.update({"video_prompt_type": "PV", "control_net_weight": 1.0, "sliding_window_overlap": 22 if H3_CONTROL_LATENT_CONTINUATION else 18})

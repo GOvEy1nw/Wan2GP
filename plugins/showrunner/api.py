@@ -7,6 +7,8 @@ import json
 import re
 import shutil
 import tempfile
+import uuid
+import zipfile
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -14,12 +16,15 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from . import production as model, titles
 
 WEB = Path(__file__).with_name("web")
 GUIDE = Path(__file__).resolve().parents[2] / "docs" / "SHOWRUNNER.md"
+GALLERY = Path(__file__).resolve().parents[2] / "shared" / "gradio"
+GALLERY_ZOOM = ("image_zoom.js", "image_zoom.css")  # the zoom of WanGP's image gallery, for the page's own image previews
 ASSET = re.compile(r"(?:js|css)/[\w.-]+\.(?:js|css)|icons/[\w.-]+\.svg|[\w.-]+\.(?:svg|png|webmanifest)")
 
 
@@ -34,6 +39,12 @@ class Operations(BaseModel):
     base_revision: int | None = None
 
 
+class RenderRequest(BaseModel):
+    shots: list[str]
+    final: bool = False
+    new_seed: bool | None = None  # None: a draft draws a new seed, a final keeps its take's
+
+
 class DirectorRequest(BaseModel):
     task: str
     message: str = ""
@@ -45,8 +56,21 @@ class TemplatePick(BaseModel):
     template: str | None = None
 
 
+class PromptRules(BaseModel):
+    template: str
+    text: str = Field(default="", max_length=2000)
+
+
 class Archived(BaseModel):
     archived: bool = True
+
+
+class Settings(BaseModel):
+    notify_turns: bool | None = None
+    cast_loras: bool | None = None
+    show_all_errors: bool | None = None
+    show_deepy_tab: bool | None = None
+    any_shot_length: bool | None = None
 
 
 class Text(BaseModel):
@@ -112,6 +136,8 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
 
     @app.get("/assets/{name:path}")
     def asset(name: str):
+        if name in GALLERY_ZOOM:
+            return FileResponse(GALLERY / name, headers={"Cache-Control": "no-cache"})
         if not ASSET.fullmatch(name) or not (WEB / name).is_file():
             raise HTTPException(404)
         return FileResponse(WEB / name, headers={"Cache-Control": "no-cache"})
@@ -136,6 +162,19 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     @app.post("/api/templates")
     def choose_default_template(request: TemplatePick):
         return showrunner.choose_default_template(request.role, request.template or None)
+
+    @app.post("/api/prompt-rules")
+    def set_prompt_rules(request: PromptRules):
+        return showrunner.set_prompt_rules(request.template, request.text)
+
+    @app.get("/api/settings")
+    def settings():
+        return showrunner.host.settings()
+
+    @app.post("/api/settings")
+    def save_settings(request: Settings):
+        showrunner.host.save_settings(**request.model_dump(exclude_none=True))
+        return showrunner.host.settings()
 
     @app.post("/api/productions")
     def create(request: Created):
@@ -187,6 +226,29 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
         production(production_id)
         return store.duplicate(production_id).snapshot()
 
+    @app.get("/api/productions/{production_id}/export")
+    async def export(production_id: str):
+        title = production(production_id).snapshot()["title"]
+        folder = store.root / ".exports"  # beside the productions, not on the system drive: a production can weigh gigabytes
+        folder.mkdir(exist_ok=True)
+        path = await run_in_threadpool(store.export, production_id, folder / f"{production_id}-{uuid.uuid4().hex[:8]}.zip")
+        name = re.sub(r'[\\/:*?"<>|]+', " ", title).strip() or production_id
+        return FileResponse(path, filename=f"{name}.zip", background=BackgroundTask(path.unlink, missing_ok=True))
+
+    @app.post("/api/productions/import")
+    async def import_production(file: UploadFile = File(...)):
+        folder = store.root / ".exports"
+        folder.mkdir(exist_ok=True)
+        temporary = folder / f"import-{uuid.uuid4().hex[:8]}.zip"
+        with temporary.open("wb") as handle:
+            shutil.copyfileobj(file.file, handle, 1 << 20)
+        try:
+            return (await run_in_threadpool(store.import_zip, temporary)).snapshot()
+        except (ValueError, zipfile.BadZipFile, json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError, AttributeError) as error:  # a file from elsewhere
+            raise HTTPException(400, f"This file cannot be imported as a production: {error}")
+        finally:
+            temporary.unlink(missing_ok=True)
+
     @app.post("/api/productions/{production_id}/archive")
     def archive(production_id: str, request: Archived):
         production(production_id)
@@ -203,7 +265,7 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     @app.post("/api/productions/{production_id}/upload")
     async def upload(production_id: str, file: UploadFile = File(...), role: str = Form("bin"), target: str | None = Form(None)):
         production(production_id)
-        if role not in ("bin", "song", "reference", "cast", "take", "track", "subtitles"):
+        if role not in ("bin", "song", "source", "reference", "cast", "take", "shot", "painted", "track", "subtitles"):
             raise HTTPException(400, "Unknown upload role.")
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as handle:
             shutil.copyfileobj(file.file, handle)
@@ -222,6 +284,33 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
         if not target.owns(file):
             raise HTTPException(403, "This file does not belong to the production.")
         return FileResponse(file, filename=file.name if download else None, headers={"Cache-Control": "private, max-age=3600"})  # a download keeps its name
+
+    @app.get("/api/productions/{production_id}/media/{media_id}")
+    def gallery_media(production_id: str, media_id: str):
+        target = production(production_id)
+        if not re.fullmatch(r"(visual|audio):[0-9a-f]{12}", media_id):
+            raise HTTPException(400, "Not a media id.")
+        file = showrunner.media_of(production_id, media_id)
+        if file is None or not file.is_file():
+            raise HTTPException(404, "The production has no such media.")
+        if not target.owns(file):
+            raise HTTPException(403, "This file does not belong to the production.")
+        return FileResponse(file, headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.get("/api/productions/{production_id}/source_part")
+    def source_part(production_id: str, shot: str):
+        production(production_id)
+        return FileResponse(showrunner.source_part(production_id, shot), headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.get("/api/productions/{production_id}/source_frame")
+    def source_frame(production_id: str, shot: str, frame: int):
+        production(production_id)
+        return FileResponse(showrunner.source_frame(production_id, shot, frame), filename=f"{shot}-frame{frame}.png", headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.get("/api/productions/{production_id}/take_part")
+    def take_part(production_id: str, shot: str, take: str):
+        production(production_id)
+        return FileResponse(showrunner.take_part(production_id, shot, take), headers={"Cache-Control": "private, max-age=3600"})
 
     @app.get("/api/productions/{production_id}/analysis")
     async def analysis(production_id: str, refresh: bool = False):
@@ -242,6 +331,16 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     async def shoot_rates(production_id: str):
         production(production_id)
         return await run_in_threadpool(showrunner.shoot_rates, production_id)
+
+    @app.get("/api/productions/{production_id}/render-groups")
+    def render_groups(production_id: str, shots: str = ""):
+        production(production_id)
+        return {"groups": showrunner.render_groups(production_id, [shot for shot in shots.split(",") if shot] or None)}
+
+    @app.get("/api/productions/{production_id}/conversation")
+    def conversation(production_id: str, after: int = 0):
+        production(production_id)
+        return showrunner.director.conversation(production_id, after)
 
     @app.get("/api/productions/{production_id}/director")
     def director_status(production_id: str):
@@ -285,6 +384,16 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
         production(production_id)
         return showrunner.choose_template(production_id, request.role, request.template or None)
 
+    @app.get("/api/productions/{production_id}/sizes")
+    async def frame_sizes(production_id: str):
+        production(production_id)
+        return await run_in_threadpool(showrunner.frame_sizes, production_id)
+
+    @app.get("/api/productions/{production_id}/loras")
+    async def cast_loras(production_id: str):
+        production(production_id)
+        return await run_in_threadpool(showrunner.cast_lora_choices, production_id)
+
     @app.post("/api/productions/{production_id}/text")
     async def add_text(production_id: str, request: Text):
         production(production_id)
@@ -302,10 +411,20 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
         return await run_in_threadpool(showrunner.add_card, production_id, shot_id, request.text, request.subtitle, request.style,
                                        design=request.design or None, picture=request.picture or None)
 
+    @app.post("/api/productions/{production_id}/shots/{shot_id}/detach-sound")
+    async def detach_sound(production_id: str, shot_id: str):
+        production(production_id)
+        return await run_in_threadpool(showrunner.detach_sound, production_id, shot_id)
+
     @app.post("/api/productions/{production_id}/shots/{shot_id}/rerun")
     def rerun(production_id: str, shot_id: str):
         production(production_id)
         return showrunner.rerun(production_id, shot_id)
+
+    @app.post("/api/productions/{production_id}/render")
+    def render_now(production_id: str, request: RenderRequest):
+        production(production_id)
+        return showrunner.render_directly(production_id, request.shots, final=request.final, new_seed=request.new_seed)
 
     @app.post("/api/productions/{production_id}/shots/{shot_id}/cancel")
     def cancel(production_id: str, shot_id: str):

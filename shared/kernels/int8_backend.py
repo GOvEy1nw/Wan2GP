@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 from fnmatch import fnmatchcase
 from types import MethodType
 
@@ -118,9 +119,13 @@ def _probe_wgpkernels():
         module = importlib.import_module("wgpkernels.int8")
         if module._lib is None:
             module.load_library()
-        # Every kernel once with fixed configurations, at selection time and outside graph capture.
-        with torch.inference_mode():
-            failure = module.selftest()
+        # Every kernel once with fixed configurations, at selection time and outside graph capture. Its reference uses cuBLAS, whose workspaces
+        # stay per thread and stream: on a thread of its own, the next thread inherits this one instead of allocating another.
+        def selftest():
+            with torch.inference_mode():
+                return module.selftest()
+        with ThreadPoolExecutor(1) as thread:
+            failure = thread.submit(selftest).result()
         return (None, failure) if failure else (module, "available")
     except Exception as exc:
         return None, str(exc)
@@ -389,8 +394,9 @@ def can_fuse_linear(module, x, dtypes=(torch.bfloat16,), act=None):
     ('rms_norm', 'swiglu', or 'gelu', which only WGPKernels provide).
     WGPKernels fuse with the precision of their unfused linears (full precision or per-block activations, input operations in FP32,
     one rounding), whatever the kernel precision setting; Comfy Kitchen's rowwise fusions need the fast (approximate) setting."""
+    from mmgp.offload import lora_active
     if (torch.compiler.is_compiling() or not torch.is_inference_mode_enabled() or triton._is_fake_tensor(x) or not x.is_cuda
-            or x.dtype not in dtypes or (getattr(module, '_mm_lora_old_forward', None) and getattr(module, '_mm_lora_data', None) != {})):
+            or x.dtype not in dtypes or lora_active(module)):
         return False
     if _backend == "wgpkernels":
         group = getattr(module, '_convrot_group_size', 0)
@@ -493,6 +499,7 @@ def linear_grouped(modules, x):
     WGPKernels prepare all rows at once for their path (rows are independent). No
     weights are packed or cached, so MMGP retains their lifetime and residency.
     """
+    from mmgp.offload import lora_active
     group = getattr(modules[0], '_convrot_group_size', 0)
     common = (torch.is_inference_mode_enabled() and not torch.compiler.is_compiling() and not triton._is_fake_tensor(x) and x.is_cuda
               and x.ndim == 3 and x.is_contiguous() and len(modules) == x.shape[0]
@@ -501,8 +508,7 @@ def linear_grouped(modules, x):
                       and module.in_features == x.shape[2] and module.out_features == modules[0].out_features
                       and not getattr(module, '_wangp_linear_fusion', None)
                       and not getattr(module, '_wangp_prequantized_input', None)
-                      and (not getattr(module, '_mm_lora_old_forward', None)
-                           or getattr(module, '_mm_lora_data', None) == {}) for module in modules))
+                      and not lora_active(module) for module in modules))
     if (_backend == "wgpkernels" and common and group in (16, 64, 256) and x.dtype in (torch.bfloat16, torch.float16) and x.shape[2] % 16 == 0
             and x.numel() * 2 <= _SCRATCH_BYTES and x.data_ptr() % 16 == 0):
         tokens = x.shape[1]
@@ -549,7 +555,8 @@ def kitchen_linear_fused(input, weight, bias, input_act, act_weight, act_eps, re
     bias_arg = (_kitchen._gemm_vector_arg(bias, input.device, input.dtype) if bias is not None
                 else _kitchen._empty_cuda_tensor(input.device, input.dtype))
     act_arg = _kitchen._act_weight_arg(input_act, act_weight, input.device, input.dtype)
-    residual_arg = (_kitchen._gemm_vector_arg(residual_scale, input.device, input.dtype)
+    # Kitchen's residual epilogue always takes one scale per output channel: no scale (linear_residual_, an ungated mlp) is 1
+    residual_arg = (_kitchen._gemm_vector_arg(input.new_ones(n) if residual_scale is None else residual_scale, input.device, input.dtype)
                     if r is not None else None)
     for start in range(0, x.shape[0], rows):
         stop = min(start + rows, x.shape[0])
@@ -573,6 +580,7 @@ def kitchen_linear_fused(input, weight, bias, input_act, act_weight, act_eps, re
         del q, qs, tile
     if supplied is not None:
         torch.autograd.graph.increment_version(supplied)  # written in place: MMGP CUDA graphs copy a mutated block argument back
+        return supplied  # the tensor itself (an output that is an argument stays that argument in CUDA graphs)
     return out.reshape(*input.shape[:-1], n)
 
 
