@@ -14,7 +14,7 @@ from ..layers import kv_formats as kvf
 from .draft_sources import SuffixDrafter, WindowCosts
 from .speculative_sampling import bounded_support, capture_sampling_graph, draft_probabilities
 from ..layers import draft_chain
-from ..layers.draft_chain import CompactDrafts
+from ..layers.draft_chain import CompactDrafts, DeviceDrafts
 from ..layers.sampler import Sampler, _REPETITION_INCREMENT_LIMIT, apply_min_p_mask_, apply_sparse_repetition_penalty_
 from ..utils.context import set_context, get_context, reset_context
 
@@ -25,6 +25,10 @@ _FIRST_ALWAYS = "firstdraft" in os.environ.get("WGP_FN_ENABLE", "").split(",")  
 _CHAIN = "chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the drafts of a window read from mapped RAM, the switch goes with the others at the end
 _DRAFT_COSTS = "draftcost" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # a greedy window's drafts decided by what they bring at the measured costs, until proven
 _SINGLE_DECODE = "host_py" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # _prepare_single_decode and its kept sampling parameters, proven: the switch goes with the others at the end
+_GPU_CHAIN = "gpu_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # a sampled window's drafts drawn on the GPU in one graph, no host wait per draft: MTP-4 on Deepy's prose 17.1 -> 16.75 ms per pass
+_LONG_CHAIN = "long_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the model's long draft chain while its recent drafts are accepted (Qwen3.8 27B on Deepy's tool calls: 4.6 -> 6.2 tokens per pass, 231 -> 261 tok/s)
+_LONG_CHAIN_RATE = 0.7  # the acceptance from which the drafts beyond the usual chain bring more than their rows and drafter passes cost
+_LONG_CHAIN_FADE = 0.9  # what a verification weighs in that acceptance against the ones before it
 _DRAFT_PREFETCH = "draft_prefetch" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the n-gram rows of a window read while its drafts are computed: Deepy's context 141 -> 147 tok/s, a short prompt 168 -> 184 (drive calm); the switch goes with the others at the end
 
 
@@ -188,7 +192,7 @@ class ModelRunner:
         self.mmgp = self.mmgp_graphs or bool(getattr(model_object, "_lm_engine_mmgp", False))
         if self.mmgp_graphs:  # only MMGP moves its weights: the weights key of a whole-model graph is checked in constant time
             model_object._mm_graph_placement_key = True
-        self._max_speculative_draft_tokens = min(self._MAX_SPECULATIVE_DRAFT_TOKENS, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_tokens", 2))))
+        self._max_speculative_draft_tokens = min(self._MAX_SPECULATIVE_DRAFT_TOKENS, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_tokens", 2)), self._long_chain_tokens()))
         self.speculative_stats = self._new_speculative_stats()
         self.sampler = Sampler()
         
@@ -245,7 +249,7 @@ class ModelRunner:
             return
         from mmgp import cuda_graphs
         tensors = [getattr(self, name, None) for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_overlay", "kv_overlay_scales", "kv_index_pool")]
-        for graph_vars in (getattr(self, "graph_vars", None) or {}, *(getattr(self, "speculative_graph_vars", None) or {}).values()):
+        for graph_vars in (getattr(self, "graph_vars", None) or {}, *(getattr(self, "speculative_graph_vars", None) or {}).values(), getattr(self, "_tree_graph_vars", None) or {}):
             tensors.extend(graph_vars.values())
         if isinstance(getattr(self, "mtp_graph", None), _DraftStage):
             for graph_vars in (self.mtp_graph_vars, *self.mtp_refresh_graphs.values()):
@@ -375,7 +379,13 @@ class ModelRunner:
             "lookup_drafted": 0,
             "lookup_accepted": 0,
             "rows_by_window": {},  # rows -> [windows, milliseconds, accepted drafts]
+            "recent_accepted": 0.0,  # the drafts of the latest verifications, fading: those accepted, and those verified (the accepted ones and the one refused)
+            "recent_verified": 0.0,
         }
+
+    def _long_chain_tokens(self) -> int:
+        """The drafts of a window while the recent ones are accepted (0: the usual count always)."""
+        return int(getattr(self.model, "_prompt_enhancer_speculative_long_tokens", 0)) if _LONG_CHAIN else 0
 
     def speculative_telemetry(self, seq_id: int, sequence_tokens: int) -> dict:
         stats = self.speculative_stats
@@ -491,11 +501,16 @@ class ModelRunner:
                     prepare(self._max_speculative_draft_tokens + 1, max_num_blocks)
             self._prepare_target_speculative_state()
 
+    def _speculative_tree(self):
+        """The static draft tree verified in one pass instead of a chain (block drafters with a tree), or None."""
+        return None
+
     def _prepare_target_speculative_state(self) -> None:
+        tree = self._speculative_tree()
         for module in self.model.blk:
             prepare_speculative_state = getattr(module, "prepare_speculative_state", None)
             if callable(prepare_speculative_state):
-                prepare_speculative_state(self._max_speculative_draft_tokens + 1)
+                prepare_speculative_state(self._max_speculative_draft_tokens + 1, *(() if tree is None else (tree.size,)))
         stateful_modules = [module for module in self.model.blk if getattr(module, "layer_type", None) == "linear_attention"]
         # Recurrent states of replaying layers are recomputed from one saved state; the others are copied from their snapshots.
         snapshot_modules = [module for module in stateful_modules if module.speculative_replay is None]
@@ -1874,6 +1889,9 @@ class ModelRunner:
             stats["lookup_windows"] += 1
             stats["lookup_drafted"] += rows - 1
             stats["lookup_accepted"] += accepted
+        if rows > 1:
+            stats["recent_accepted"] = _LONG_CHAIN_FADE * stats["recent_accepted"] + accepted
+            stats["recent_verified"] = _LONG_CHAIN_FADE * stats["recent_verified"] + min(accepted + 1, rows - 1)
         costs = self._draft_costs()
         costs.observe(rows, milliseconds, accepted, bool(lookup), lookup)
         costs.observe_confidences(getattr(self, "_window_confidences", ()), accepted)
@@ -1883,6 +1901,8 @@ class ModelRunner:
         chain = self._draft_chain
         graph_vars, cache = self.mtp_graph_vars, self.model.mtp._cache
         temperature, top_p = (float(seq.temperature), float(seq.top_p) if seq.top_p is not None and 0.0 < float(seq.top_p) < 1.0 else 1.0) if rejection_sampling else (1.0, 1.0)
+        if rejection_sampling and threshold <= 0.0 and _GPU_CHAIN and getattr(self.model, "lm_engine_prefetch", None) is None:
+            return self._gpu_chain_drafts(draft_state, draft_count, start_position, cache_length, temperature, top_p)
         logits, hidden = draft_state["logits"], draft_state["hidden_states"]
         chain.seqlens = cache.cache_seqlens
         step_logits = graph_vars["logits"][0, -1]
@@ -1922,6 +1942,57 @@ class ModelRunner:
         if not rejection_sampling:
             return tokens, cache_length, None
         return (chain.draft_ids_gpu[:len(tokens)], cache_length, CompactDrafts(chain, len(tokens))) if tokens else ([], cache_length, None)
+
+    def _gpu_chain_drafts(self, draft_state: dict, draft_count: int, start_position: int, cache_length: int, temperature: float, top_p: float):
+        """The drafts of a sampled window in one CUDA graph: each proposal drawn on the GPU (draft_chain._select_draw) from a uniform of the
+        sampling generator, the drafter's passes in between; the host waits for none of them. The acceptance reads the same normalized
+        proposals, so verification stays exact."""
+        chain, cache = self._draft_chain, self.model.mtp._cache
+        key = (id(self.mtp_graph), id(cache), cache.key_cache[0].data_ptr(), draft_count, temperature, top_p)
+        entry = chain.graphs.get(key)
+        if entry is None:
+            chain.graphs = {k: v for k, v in chain.graphs.items() if k[:3] == key[:3]}  # the drafter's graph or cache changed: their chains go with them
+            entry = chain.graphs[key] = self._capture_gpu_chain(draft_state, draft_count, start_position, temperature, top_p)
+        entry["logits"].copy_(draft_state["logits"])
+        entry["hidden"].copy_(draft_state["hidden_states"].reshape_as(entry["hidden"]))
+        entry["host_bases"][0], entry["host_bases"][1] = start_position, cache.get_seq_length()
+        entry["bases"].copy_(entry["host_bases"], non_blocking=True)  # pinned: the previous pass's copy has completed (its acceptance read back)
+        entry["uniforms"].uniform_(generator=self._sampling_generator)
+        entry["graph"].replay()
+        cache.advance(draft_count - 1)
+        self._window_confidences = ()
+        return chain.device_draft_ids[:draft_count], cache_length, DeviceDrafts(chain, draft_count)
+
+    def _capture_gpu_chain(self, draft_state: dict, draft_count: int, start_position: int, temperature: float, top_p: float) -> dict:
+        from mmgp import allocator
+        chain, mtp, graph_vars = self._draft_chain, self.model.mtp, self.mtp_graph_vars
+        cache = mtp._cache
+        device = graph_vars["input_ids"].device
+        entry = dict(logits=draft_state["logits"].clone(), hidden=graph_vars["hidden_states"].clone().copy_(draft_state["hidden_states"].reshape_as(graph_vars["hidden_states"])),
+                     uniforms=torch.full((draft_count,), 0.5, device=device), bases=torch.tensor([start_position, cache.get_seq_length()], dtype=torch.int64, device=device),
+                     host_bases=torch.zeros(2, dtype=torch.int64, pin_memory=True), input_ids=torch.zeros((1, 1), dtype=torch.int64, device=device),
+                     positions=torch.zeros(1, dtype=torch.int64, device=device))
+
+        def run():
+            logits, hidden = entry["logits"], entry["hidden"]
+            for index in range(draft_count):
+                feed = index + 1 < draft_count
+                chain.select_draw(logits, index, temperature, top_p, entry["uniforms"], entry["bases"], entry["input_ids"], entry["positions"], cache.cache_seqlens, feed)
+                if feed:
+                    hidden, step_logits = mtp(entry["input_ids"], entry["positions"], hidden, last_logits_only=True, cache_prepared=True)
+                    logits = step_logits[0, -1]
+        pool = torch.cuda.graph_pool_handle()
+        stream = torch.cuda.Stream(device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        # the warmup compiles the kernels; its drafter passes write the cache rows past its length, which every replay rewrites before reading
+        with torch.cuda.stream(stream), allocator.graph_warmup(pool):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool, stream=stream, capture_error_mode="thread_local"):
+            run()
+        torch.cuda.synchronize()
+        entry["graph"] = graph
+        return entry
 
     def _chain_ready(self, graph_vars, target_vocab: int) -> bool:
         if self._draft_chain is None:
@@ -2054,7 +2125,8 @@ class ModelRunner:
             execution = "eager" if self.enforce_eager else "CUDA graph"
             draft_tokens = self.model._prompt_enhancer_speculative_sampling_tokens if seq.top_k != 1 else self.model._prompt_enhancer_speculative_tokens
             method = self.model.mtp.method if getattr(self.model, "_block_draft", False) else "native MTP"
-            print(f"[Deepy][Speculative] method={method} ({sampling_method}, up to {draft_tokens} draft tokens, {execution} verification).")
+            long_chain = f", {self._long_chain_tokens()} while they are accepted" if self._long_chain_tokens() > draft_tokens else ""
+            print(f"[Deepy][Speculative] method={method} ({sampling_method}, up to {draft_tokens} draft tokens{long_chain}, {execution} verification).")
             self.model._prompt_enhancer_speculative_method_logged = True
         sample_key = (seq.temperature, seq.cfg_scale, seq.top_k, seq.top_p, seq.min_p, seq.repetition_penalty)
         if self._mtp_sample_params is None or self._mtp_sample_params[0] != sample_key:
@@ -2074,6 +2146,12 @@ class ModelRunner:
         max_drafts = min(self._max_speculative_draft_tokens, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_tokens", 1))))
         if seq.top_k != 1:
             max_drafts = min(max_drafts, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_sampling_tokens", max_drafts))))
+        stats = self.speculative_stats
+        if stats["recent_accepted"] >= _LONG_CHAIN_RATE * stats["recent_verified"] > 0:  # predictable text (a tool call, code, a list): the drafts beyond the usual chain are accepted too
+            max_drafts = max(max_drafts, min(self._max_speculative_draft_tokens, self._long_chain_tokens()))
+        tree = self._speculative_tree()
+        if tree is not None and remaining_tokens > tree.depth and seq.last_block_num_tokens + tree.size - 1 <= self.block_size:
+            return self._run_tree_pass(seq, sample_params)  # its rows fit the last KV page and its longest path the token budget
         draft_count = min(max_drafts, remaining_tokens - 1, self.block_size - seq.last_block_num_tokens - 1)
         if draft_count < 1:
             return self._run_native_mtp_target_token(seq, sample_params)

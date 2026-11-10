@@ -8,6 +8,7 @@ from typing import Any, Tuple
 import torch
 from mmgp import offload
 from safetensors import safe_open
+from tqdm import tqdm
 from shared.utils import files_locator as fl
 from shared.utils.cancellation import check_cancelled
 
@@ -22,8 +23,8 @@ from .assets import (
     LLAMA32_FOLDER,
     LLAMAJOY_FOLDER,
 )
-from shared.deepy.config import resolve_deepy_kv_cache_quantization
-from .config import resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime
+from shared.deepy.config import gguf_kernels_warning, resolve_deepy_kv_cache_quantization
+from .config import mtp_auto_long_drafts, resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime, split_speculative_decoding
 
 
 @dataclass(slots=True)
@@ -139,6 +140,9 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
     ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled=enhancer_enabled, qwen_backend=qwen_backend, speculative_decoding=speculative_decoding)
 
     if enhancer_enabled in (3, 4, 5, 6, 7):
+        kernels_warning = gguf_kernels_warning() if torch.cuda.is_available() else ""  # the kernels exist for NVIDIA and AMD GPUs only
+        if kernels_warning:
+            tqdm.write(f"\033[91m[Prompt Enhancer / Deepy] {kernels_warning}\033[0m")
         deepy_kv_cache_quantization, kv_cache_message = resolve_deepy_kv_cache_quantization(deepy_kv_cache_quantization)
         if kv_cache_message:
             print(f"[Prompt Enhancer / Deepy] {kv_cache_message}")
@@ -173,6 +177,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
             default_dtype = torch.bfloat16
         text_model_path = get_qwen35_text_gguf_path(assets_dir, variant=qwen35_variant, backend=quantization) if backend == enhancer_quantization_GGUF else None
         fit = lambda: qwen35_mtp_fit(assets_dir, qwen35_variant, backend, text_model_path, deepy_kv_cache_quantization)
+        auto_draft_count = split_speculative_decoding(speculative_decoding)[1] is None  # Auto, or MTP with an automatic draft count
         speculative_decoding, speculative_decoding_message = resolve_prompt_enhancer_speculative_decoding(enhancer_enabled, speculative_decoding, qwen_backend=qwen_backend, fit=fit)
         speculative_decoding, speculative_tokens = speculative_decoding_runtime(speculative_decoding)
         if speculative_decoding_message:
@@ -196,6 +201,8 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
                 speculative_tokens = min(speculative_tokens, 7)
             runtime.llm_model._prompt_enhancer_speculative_tokens = speculative_tokens
             runtime.llm_model._prompt_enhancer_speculative_sampling_tokens = speculative_tokens
+            if auto_draft_count and speculative_decoding == 1:
+                runtime.llm_model._prompt_enhancer_speculative_long_tokens = mtp_auto_long_drafts(enhancer_enabled, qwen_backend, speculative_tokens)
         runtime.llm_tokenizer = getattr(runtime.llm_model, "_prompt_enhancer_tokenizer", None)
         runtime.llm_model.eval()
         caption_embedding_model = alias_qwen35_text_embedding_for_mmgp(runtime.llm_model)
