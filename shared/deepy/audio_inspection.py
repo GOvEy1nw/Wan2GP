@@ -17,7 +17,7 @@ MAX_ENVELOPE_WINDOWS = 600
 _FRAME_LOG = re.compile(r"\bt:\s*([\d.]+)\s+TARGET:.*?\bM:\s*(-?[\d.]+|-?inf|nan)")
 
 
-def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, silence_db=-50.0, min_silence=0.2, preview_path=None, preview_seconds=10.0, window_s=None):
+def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, silence_db=-50.0, min_silence=0.2, preview_path=None, preview_seconds=10.0, window_s=None, window_peaks=False):
     numbers = [start_time, silence_db, min_silence, preview_seconds, *([] if duration is None else [duration]), *([] if window_s is None else [window_s])]
     if not all(math.isfinite(value) for value in numbers) or start_time < 0 or duration is not None and duration <= 0:
         raise ValueError("Times must be finite; start_time must be non-negative and duration positive.")
@@ -63,7 +63,7 @@ def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, sile
     # Trim before metering: an output -t alone can let the filter inspect later frames.
     filters = ([f"atrim=end_sample={round(duration * rate)}"] if duration is not None else []) + [f"ebur128=peak=true:framelog={'info' if window_s is not None else 'verbose'}"]  # info logs the 100 ms frames
     with tempfile.TemporaryFile() as log:
-        process = subprocess.Popen(command + ["-af", ",".join(filters), "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"], stdout=subprocess.PIPE, stderr=log)
+        process = subprocess.Popen(command + ["-af", ",".join(filters), "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log)
         try:
             while data := process.stdout.read(window * channels * 4):
                 samples = np.frombuffer(data, dtype="<f4").reshape(-1, channels).astype(np.float64)
@@ -124,7 +124,7 @@ def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, sile
         preview = command.copy()
         if duration is not None:
             preview = preview[:-2]
-        completed = subprocess.run(preview + ["-t", str(seconds), "-ac", "2", "-ar", "24000", "-c:a", "pcm_s16le", "-y", str(preview_path)], capture_output=True)
+        completed = subprocess.run(preview + ["-t", str(seconds), "-ac", "2", "-ar", "24000", "-c:a", "pcm_s16le", "-y", str(preview_path)], stdin=subprocess.DEVNULL, capture_output=True)
         if completed.returncode:
             Path(preview_path).unlink(missing_ok=True)
             raise ValueError(completed.stderr.decode(errors="replace")[-1500:])
@@ -139,8 +139,11 @@ def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, sile
                 index = min(int(max(float(time_text) - 0.05, 0) / window_s), max(envelope))
                 momentary[index] = max(momentary.get(index, -math.inf), loudness)
         windows = [envelope[index] for index in range(max(envelope) + 1)]  # contiguous: every window of the range holds samples
-        result["envelope"] = {"window_s": window_s, "start_s": start_time, "rms_dbfs": [None if (value := db(math.sqrt(total / count))) is None else round(value, 1) for total, count, _ in windows],
-                              "peak_dbfs": [None if (value := db(top)) is None else round(value, 1) for _, _, top in windows], "momentary_max_lufs": [momentary.get(index) for index in range(len(windows))]}
+        # whole dB: levels per window locate sections, gaps and balance (the overall figures above keep their decimals); peaks per window on request
+        result["envelope"] = {"window_s": window_s, "start_s": start_time, "rms_dbfs": [None if (value := db(math.sqrt(total / count))) is None else round(value) for total, count, _ in windows],
+                              "momentary_max_lufs": [None if (value := momentary.get(index)) is None else round(value) for index in range(len(windows))]}
+        if window_peaks:
+            result["envelope"]["peak_dbfs"] = [None if (value := db(top)) is None else round(value, 1) for _, _, top in windows]
     return result
 
 
@@ -159,7 +162,7 @@ def music_beats(path, *, audio_track_no=1, start_time=0.0, duration=None):
     limit = MAX_BEAT_SECONDS + 1 if duration is None else min(duration, MAX_BEAT_SECONDS + 1)
     command = [_get_ffmpeg_path(), "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", str(start_time), "-i", str(path), "-t", str(limit),
                "-map", f"0:a:{audio_track_no - 1}", "-vn", "-ac", "1", "-ar", str(BEAT_RATE), "-f", "f32le", "pipe:1"]
-    completed = subprocess.run(command, capture_output=True)
+    completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True)
     if completed.returncode:
         raise ValueError(f"Audio decoding failed: {completed.stderr.decode(errors='replace')[-1500:]}")
     samples, fps = np.frombuffer(completed.stdout, dtype="<f4"), BEAT_RATE / BEAT_HOP
@@ -250,7 +253,7 @@ def speech_intervals(path, *, start_time=0.0, duration=None, isolated=None, marg
     -60 dBFS) is treated as isolated. Energy below -55 dBFS never counts."""
     command = [_get_ffmpeg_path(), "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", str(start_time), "-i", str(path), *(["-t", str(duration)] if duration else []),
                "-vn", "-af", "highpass=f=200,lowpass=f=4000", "-ac", "1", "-ar", str(SPEECH_RATE), "-f", "f32le", "pipe:1"]
-    completed = subprocess.run(command, capture_output=True)
+    completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True)
     if completed.returncode:
         raise ValueError(f"Audio decoding failed: {completed.stderr.decode(errors='replace')[-1500:]}")
     samples = np.frombuffer(completed.stdout, dtype="<f4")
@@ -283,7 +286,7 @@ def voice_pitch(path, *, start_time=0.0, duration=None):
     male ones below. Meaningless on a full mix, whose instruments dominate the autocorrelation."""
     command = [_get_ffmpeg_path(), "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", str(start_time), "-i", str(path), *(["-t", str(duration)] if duration else []),
                "-vn", "-af", "lowpass=f=1200", "-ac", "1", "-ar", str(SPEECH_RATE), "-f", "f32le", "pipe:1"]
-    completed = subprocess.run(command, capture_output=True)
+    completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True)
     if completed.returncode:
         raise ValueError(f"Audio decoding failed: {completed.stderr.decode(errors='replace')[-1500:]}")
     size = 1024

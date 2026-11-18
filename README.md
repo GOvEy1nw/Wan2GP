@@ -67,7 +67,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 **Official WanGP Web Site**: https://wangp.ai/
 
 > [!IMPORTANT]
-> **WanGP is free to use locally.** The official project will never ask you to pay a license fee, subscription, or donation to run WanGP on your own computer (see the license for terms).
+> **WanGP is free to use locally, at home or at work.** The official project will never ask you to pay a license fee, subscription, or donation to run WanGP on your own computer (see the license for terms). If you like WanGP, a ⭐ [star on GitHub](https://github.com/deepbeepmeep/WanGP) is always appreciated: it helps others find the project.
 >
 > **Use only the official GitHub repository or wangp.ai / wan2gp.ai websites. WanGP is not affiliated to any other third-party service using the WanGP/Wan2GP names**, unless explicitly stated here.
 
@@ -83,7 +83,27 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 9th of November 2026: WanGP v19.25 - Bonus Track
+## 12th of November 2026: WanGP v20.00 - VRAM and RAM so Low You Can't Measure Them !
+
+- **Even Less VRAM, Again!** Thought VRAM usage couldn't get any lower? The new **Smart Inputs Chunker**, which replaces the Attention Head Splitter, lets you generate **15 seconds of H3 video at 1080p with only 8 GB of VRAM!** Best of all, generation takes in the worst case **1-2% longer**. Find it in *Configuration > Performance > Smart Inputs Chunker* and choose **Auto** to use chunking only when VRAM would otherwise run short.
+
+- **VAE RAM/VRAM Reduction**: GPUs with limited VRAM just got a free quality upgrade. VAE decoders can now use much larger tiles within the same memory budget, improving output quality. WanGP automatically picks the largest tiles that fit, or skips tiling when the whole frame fits. Choose **Auto** in *Configuration > VRAM Management > VAE Tiling*, or set a fixed share of VRAM. As a bonus, some VAE decoders, including LTX-2.x, get an **extra 10-20% speedup**. You will need to install new *WGPKernels 1.5.0*.
+
+- **Infinite Sliding Windows**: Low on RAM? Say goodbye to the **3,000-frame limit**! Keep extending your video - forever and ever - while **RAM usage stays steady** as the video grows. Each new window is appended without re-encoding the earlier ones. 
+
+- **LongCat Avatar 1.6**: Put Infinite Sliding Windows to work with talking-head videos featuring **one or two people**. Animate a reference image from speech and generate several minutes with little visual degradation. All LongCat models also gain an optional **KV Cache** accelerator; paired with the distilled model, it can generate several seconds of video in just a few minutes.
+
+- **RMBG 3.0**: Generate detailed **grayscale alpha mattes in 4 steps**, preserving fine details, soft edges and transparency for cutouts and compositing. Select **Fibo 2 > RMBG-3.0** under the Fibo 2.0 family, supply a reference image and use the default prompt.
+
+- **ZONOS3 Mini**: Fast, expressive speech in **43 languages**, with **27 built-in voices** or a voice cloned from a short recording. Shape the delivery with voice presets and cues such as `[happy]` or `[whisper]`, adjust voice characteristics, or create dialogues with up to **three speakers**. The small model generates speech much faster than real time.
+
+- **Background Remover**: Choose from **U²-Net**, **BiRefNet General** and **Bria RMBG-2.0** in *Configuration > Extensions > Image Preprocessors*. Use U²-Net for speed and a smaller memory footprint, or try the alternatives for finer edges and difficult cutouts. Your choice applies to reference-image cleanup.
+
+- **Deepy Skills**: Teach **Deepy Prime** reusable workflows, from your preferred character-sheet layout to the checks you want before a video is finished. Import a `SKILL.md` file or a skill ZIP, then read, edit or delete it in *Configuration > Deepy / Prompt Enhancer > Skills*. You can also ask Prime to save a successful method as a skill. Prime reads matching skills when needed, and connected MCP agents can use the same skills.
+
+- **H3 Ref2VA: Swaps and Control Video Injection**: Choose the **BFS Character Swap v1.1 (Aligned Guide)** preset to replace the main person in a **Control Video** with a character from a **Reference Image**, keeping the scene, camera and performance. The new **Aligned Guide** process uses each control-video frame to guide the matching output frame, with LoRAs trained for this mode.
+
+## 12th of November 2026: WanGP v19.292 - Bonus Track
 - **Qwen Image 2.1 Viggle Image Swap**: a Qwen Image 2.1 variant and **Showrunner's default frame painter for Viggle Remake character swaps**. Replace one or several people in **6 steps**, keeping their poses, expressions and the scene's framing. Add the **source picture first**, then one **character sheet** per person; the picture's aspect ratio is preserved at about **1 megapixel**. Results can be slightly darker.
 
 - **H3 HyperFlow LoRA**: bring **8-step** generation to the standard and Pruned **Ref2VA** models with the new **HyperFlow Ref2VA 8 Steps** accelerator profile.
@@ -94,7 +114,15 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **H3 DMAD accelerators**: generate video with sound in **4 or 8 steps** on FL2VA and Ref2VA: choose 4 for speed or 8 for better quality. The profiles apply the matching LoRA and settings automatically. The new **DMAD Re-noise** sampler also supports **H3 Turbo Neat Prime**.
 
+- **Official H3-Image**: MiniMax's own image model generates from text, or edits and combines up to **16 reference images**, in **6 steps**. It works best around **16 megapixels** with detailed descriptions; dedicated prompt enhancers help expand short requests. Choose the full **33B** model or **Pruned 20B**, which produces nearly identical images with a smaller download and faster loading. H3 Image seems to be the **best image swapper** for Viggle.
 
+- **H3-Image: pDMD + LoRAs**: generate in **2 steps** for speed or **4 steps** for crisper detail. Two-step denoising takes less than half the time of the usual six steps; tested 4 MP images finish about **25% sooner** overall. H3-Image now shares the H3 LoRA list, so you can also try video style, realism and character LoRAs on stills, though their effect may be weaker or different.
+
+- **Faster Deepy and Prompt Enhancer on Qwen3.8 27B**: once **GGUF kernels 1.0.30** are installed, Deepy writes its answers, tool calls and image or video inspections faster with the same quality: **up to 19% faster** with the **Q3** and **Q2** checkpoints and about **4%** with **Q4**. The new optional **Faster Context Reading** setting lets Deepy read tool results, documents and restored conversations **up to twice as fast**, for about 140 MB of VRAM while reading.
+
+- **Showrunner: choose who sings**: have an uploaded or generated song sung by a cast member or a supplied voice sample, including **two voices for a duet**. Use **Change the voice** on an existing song or **Sung by** before composing. The music, lyrics and timing stay, so existing shots keep their lip sync. Requires **SeedVC v1.0 Singing** in **Configuration > Extensions**.
+
+- **Low RAM Continue Video & Late Post Processing**: extend or post-process long videos without loading them whole into RAM. Continue Video reads only the ending frames for generation and adds each new window without re-encoding earlier ones; a source needing conversion is processed once, in chunks. Now supports **Lanczos, FlashVSR, SeedVR2, RelayVSR, DLSS 5, LTX-2 upscalers and LTX 2.5 Detail Refiner**, plus **RIFE / DLSS frame interpolation and Film Grain**. LTX-2 uses the same window handling as Media Flow, with aligned audio for upscaling and detail carried across refiner windows. HDR continuation, face refiners, and interpolation combined with an AI upscaler still need the whole video in memory. **Media Flow** remains best suited to very long videos, with pause/resume, manual chunk sizing where supported, and original audio preserved without re-encoding.
 
 
 ## 8th of November 2026: WanGP v19.25 - Showrunner Makes and Remakes
@@ -170,7 +198,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
   - **Jump in the recording**: the transcript shows under the Audio gallery player, as text or as a timeline per speaker; click a line or a turn to play from there.
   - **Subtitled videos**: get the video back with the transcript or translation as subtitles, shown or hidden with the new **CC** button of the Video gallery.
   - **Your names and words**: name the speakers, give the spelling of names and jargon, keep every hesitation or get clean text, with timings per turn or per word; translations can be timed and subtitled too.
-  - **Deepy Prime**: ask for speaker-labelled transcripts, translations or subtitled videos once a Nemotron model is chosen in **Configuration > Prompt Enhancer / Deepy > Transcription**.
+  - **Deepy Prime**: ask for speaker-labelled transcripts, translations or subtitled videos once a Nemotron model is chosen in **Configuration > Deepy / Prompt Enhancer > Transcription**.
 
 - **WanGP Manager (Experimental, Windows)**: [download the official app](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe) for guided setup that selects the recommended GPU profile and installs Python and dependencies for you.\
   Keep several installations, update their dependencies and recommended kernels, try an older WanGP build or restore both source and environment from a saved version.\
@@ -183,7 +211,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 29th of October 2026: WanGP v18.888 - Are You Game?
 
-- **Deepy Prime Can Now Build Apps**: turn an idea into a game, an interactive story, a music toy or an explorable 3D scene, with images, video, sound and 3D assets made by WanGP's generative models. Play in the chat, keep your creations in the new **Apps gallery**, save progress and share them as `.wgpapp` files. Deepy can keep improving an app in later conversations, including one someone else shared with you. This development preview is off by default: under **Configuration → Prompt Enhancer / Deepy → Python**, enable **Python Sandbox** and set **App Development (Advanced)** to **Web Apps**, then save. See the [Apps guide](docs/APPS.md).
+- **Deepy Prime Can Now Build Apps**: turn an idea into a game, an interactive story, a music toy or an explorable 3D scene, with images, video, sound and 3D assets made by WanGP's generative models. Play in the chat, keep your creations in the new **Apps gallery**, save progress and share them as `.wgpapp` files. Deepy can keep improving an app in later conversations, including one someone else shared with you. This development preview is off by default: under **Configuration → Deepy / Prompt Enhancer → Python**, enable **Python Sandbox** and set **App Development (Advanced)** to **Web Apps**, then save. See the [Apps guide](docs/APPS.md).
 
 - **3D Models, Organized by What You Want to Do**: start with **Create**, **Texture**, **Refine**, **Split**, **Animate** or **Reconstruct**, then choose a model for that task. Shape generation and texturing are now separate choices: use a preset to combine them in one generation, optionally adding new **Hi3D** refinement before also new **SUPRA-Tex**, **Hunyuan3D 2.1 Paint** or **TRELLIS.2 Texture** paints the result. Existing meshes can go straight to the matching tool with **To Input Mesh** in the 3D gallery. See the [3D models guide](docs/MODELS.md#3d-models).
 
@@ -218,7 +246,7 @@ Create a world, then walk through it with the keyboard in the new **Worlds galle
 
 - **Fast Quantized KV Cache**: **MOSS Image Edit**, **Qwen Image 2.1** and **Wan Animate 2** now support quantized KV caches that make generation from image or video references much faster, even with **memory profiles 4 and 5**.
 
-- **More Speed Boost and VRAM Savers**: update **WGPKernels to 1.4.3** and **GGUF kernels to 1.0.29** using the [installation guide](docs/INSTALLATION.md).
+- **More Speed Boost and VRAM Savers**: update **WGPKernels to 1.4.3** and **GGUF kernels to 1.0.30** using the [installation guide](docs/INSTALLATION.md).
 
 ### Deepy Prime — Twice the Context, More Ways to Create
 

@@ -42,11 +42,14 @@ def _brief_text(doc: dict[str, Any]) -> str:
         lines.append(f"Source video to remake (its motion, camera, timing and soundtrack stay): {_name(brief['source'])}")
     if brief.get("song"):
         lines.append(f"Song (drives timing and lip sync): {_name(brief['song'])}")
+    elif singers := model.song_singers(doc):
+        lines.append(f"Sung by, the user's choice: the song you compose is sung by {singers}. Song models take no voice: right after edit(song=...) makes it the production's song, "
+                     f"call change_singer_voice(cast_ids={brief['song_voices']}), then check_song.")
     if brief.get("references"):
         lines.append("Reference media: " + ", ".join(_name(path) for path in brief["references"]))
     format_parts = [f"aspect {brief['aspect']}", f"{brief['resolution']}" if not brief.get("draft_resolution") else f"{brief['draft_resolution']} draft for {brief['resolution']}"]
-    if brief["kind"] != "remake" and (brief.get("duration_s") or not brief.get("song")):  # a remake lasts as long as its source
-        format_parts.append(f"about {brief.get('duration_s') or model.DEFAULT_LENGTH_S:g} s in total")
+    if brief["kind"] != "remake" and (length := model.wanted_length(doc)):  # a remake lasts as long as its source, a song sets the length
+        format_parts.append(f"about {length:g} s in total" + ("" if brief.get("duration_s") or length == model.DEFAULT_LENGTH_S else ", the time its script takes to say"))
     lines.append("Format: " + ", ".join(format_parts) + ".")
     if brief.get("draft_resolution"):
         lines.append(f"Make every picture (cast, looks, places, cards) at {model.resolution(brief)}, the target: a draft and its final use the same pictures. render shoots video at the draft size by itself; the user shoots shots final when happy.")

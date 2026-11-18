@@ -66,8 +66,6 @@ Acceleration choices have different trade-offs. **PDD** variants use a fixed eig
 
 **[Viggle Animate](modeltype:viggle_animate) is an H3-derived character-replacement model.** Supply the original control video and one frame from it in which an image editor has replaced the character. Preserve that frame's pose, background, framing and dimensions. Viggle follows the original motion in a fixed three-step workflow, using sliding windows for longer footage. Its text generation prompt is ignored: express the change in the edited frame. Large pose changes, interacting characters and cuts are more challenging.
 
-**[P-H3-Image](modeltype:minimax_h3_image) is an H3-derived image model**, listed with H3 although it makes no video or audio. It generates a single image from text, or edits an image with up to eight input images, in eight steps, or in two to four steps with its pDMD accelerator profiles. It works best at 8 megapixels and is strongest at photorealism, film and editorial looks and graphic styles with short quoted text. It renders full, specific prompts much better than short requests, so write them out or use the optional **Write** button.
-
 The family also provides an audio-only **[H3 Voice Clone](modeltype:minimax_h3_tts_ref2va_pruned)** preset and **H3 Face Refiner** for finishing video; these are related H3 workflows, not separate model families.
 
 <a id="ltx-2-and-ltx-23"></a>
@@ -154,6 +152,12 @@ The older 20B family remains useful:
 - **[Qwen Image Layered](modeltype:qwen_image_layered_20B)** for decomposing an image into editable RGBA layers.
 
 Selected 20B variants have Nunchaku checkpoints for supported hardware. Qwen 2.1 uses its own model and adapter formats: do not assume older Qwen Image LoRAs or VAEs are interchangeable.
+
+### H3
+
+**[MiniMax H3-Image 33B](modeltype:minimax_h3_image)** is MiniMax's image model on the H3 architecture. It generates a single image from text, or edits and combines up to 16 input images, in six steps without guidance. It works best around 16 megapixels and follows long, detailed descriptions much better than short requests: write them out or use the optional **Write** button, which produces the detailed captions and edit descriptions the model expects. **[H3-Image Pruned 20B](modeltype:minimax_h3_image_pruned)** is a smaller download that loads faster for nearly identical images. H3-Image shares the MiniMax H3 LoRA list: style, realism or character LoRAs made for the video models can carry over, often with a weaker or different effect, while LoRAs for video motion, control or fewer steps do not suit it.
+
+**[P-H3-Image](modeltype:minimax_p_h3_image)** is Pruna's image model derived from H3 FL2VA. It generates a single image from text, or edits an image with up to eight input images, in eight steps, or in two to four steps with its pDMD accelerator profiles. It works best at 8 megapixels and is strongest at photorealism, film and editorial looks and graphic styles with short quoted text. It also renders full, specific prompts much better than short requests. It shares the MiniMax H3 LoRA list.
 
 ### Ming Image
 
@@ -324,6 +328,15 @@ For a new workflow:
 4. Test a short clip or moderate image resolution before increasing duration, batch size or references.
 5. Use sliding windows for supported long-video workflows, and tiling where the model exposes it. Look for seams or continuity changes when tuning these options.
 6. Add compatible LoRAs, controls and upsampling one feature at a time so their effects are easy to compare.
+
+### VAE Tiling
+
+The last step of a generation turns the result into pixels with the model's VAE; large pictures and frames can need several GB of VRAM there. **VAE Tiling** (Configuration > RAM/VRAM Management) sets the VRAM this step may use, the VAE itself included:
+
+- **Auto** (default): all the VRAM that other programs leave free when the generation starts. The fastest choice, but not a predictable one: with a browser or a game open, the same job can be cut into smaller tiles than the day before.
+- **Up to 3/4**, **1/2** or **1/3 of the VRAM**: a fixed share of your GPU, whatever else is running. The same job is always cut the same way. Choose a smaller share when other programs need VRAM, or if you see out of memory errors while decoding.
+
+WanGP estimates what each tile size needs at your resolution and picks the largest that fits. When the whole picture or frame fits, it is not tiled at all, which is both the fastest and free of any tile blending. Smaller tiles take longer, and very small ones can show slight differences where tiles meet. A few models still use fixed tile sizes. MiniMax H3 always works in 256-pixel tiles, the only size its video VAE handles; for it the setting decides how many tiles are decoded together: more at once is a little faster and needs more VRAM.
 
 INT8, FP8, GGUF, NVFP4, NF4 and Nunchaku are checkpoint/quantization choices, not separate creative model families. Availability, memory savings, speed and output can vary with the model, GPU and installed kernels. Follow the [installation guide](INSTALLATION.md) or [AMD guide](AMD-INSTALLATION.md) for hardware-specific setup.
 

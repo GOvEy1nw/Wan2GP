@@ -46,7 +46,7 @@ function applyTheme() {
   document.documentElement.dataset.theme = theme;
 }
 applyTheme();
-window.addEventListener('focus', applyTheme);
+window.addEventListener('focus', () => { applyTheme(); mounted?.refreshSingerVoice?.(); });
 
 export const actions = {
   async ops(ops, { quiet = false } = {}) {
@@ -229,7 +229,7 @@ const refreshDoc = debounce(async () => {
 }, 120);
 
 // The showrunner streams its words and steps many times a second, and a render its progress: the page shows them at most ten times a second.
-const drawLive = throttle(() => { director?.live?.(); renderTopbar(); });
+const drawLive = throttle(() => { director?.live?.(); inspector?.update?.(); renderTopbar(); });  // the shot panel redraws only when its buttons change
 const drawProgress = throttle(() => { mounted?.progress?.(); renderTopbar(); });  // the pill says how far the user's renders are
 
 function eventsFor(pid) {
@@ -268,6 +268,12 @@ function eventsFor(pid) {
       else state.renders[event.shot] = event.progress ?? 0;
       drawProgress();
     },
+    song_voice: event => {  // the song sung in another voice, changed from the Brief
+      state.songVoice = event.done ? null : { progress: event.progress, status: event.status };
+      if (event.error) toast(`The singer's voice could not be changed: ${event.error}`, 'error', 8000);
+      else if (event.done) toast('The song is sung in its new voice. The former version is in the bin.', 'ok');
+      mounted?.songVoice?.();
+    },
     assemble: event => {
       if (!state.userAssembling) {  // an assembly the user started reports on its own button
         if (event.state === 'done') toast('The edit is assembled: watch it in Deliver.', 'ok');
@@ -281,6 +287,7 @@ function eventsFor(pid) {
 // After events were missed (the page was hidden or the connection dropped): the production, its renders and the showrunner's state now.
 async function catchUp() {
   state.renders = {};  // a render still running reports again with its next progress
+  mounted?.refreshSingerVoice?.();  // the SeedVC choice may have changed while Configuration was open
   refreshDoc();
   let changed = true;
   try {
@@ -296,6 +303,7 @@ async function catchUp() {
   mounted?.progress?.();
   if (!changed) return;  // the showrunner's state is unchanged: its panel and the top bar stay as they are (no flash when the tab comes back)
   director?.live?.();
+  inspector?.update?.();
   conversation?.catchUp();
   renderTopbar();
 }
@@ -492,7 +500,7 @@ export function activity(live) {
   return shot ? `Shooting ${shot[1]} · ${shot[2]} of ${shot[3]}` : phase;
 }
 
-// Renders the user started without the showrunner (Render now, Reshoot): their shots show rendering from the click, the one WanGP works on
+// Renders the user started without the showrunner (Render now, Render again): their shots show rendering from the click, the one WanGP works on
 // reports its progress, with the neighbours a remake renders together with it.
 function userRenders(doc) {
   const shots = doc.shots.filter(shot => shot.status === 'rendering');
