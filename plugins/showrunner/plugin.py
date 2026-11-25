@@ -113,10 +113,9 @@ class WanGPHost:
         return True
 
     def lip_reader(self):
-        """How a shot's lips follow the voice: a function for the shots of one review, whose model goes with it."""
+        """How a shot's lips follow the voice: a function for the shots of one review (the pose models stay in RAM between shots)."""
         from shared.deepy import lip_sync
-        models = lip_sync.load_models()
-        return lambda video, start_s, frames, fps, voice, voice_at: lip_sync.measure(video, start_s, frames, fps, voice, voice_at, models)
+        return lip_sync.measure
 
     def speaker_turns(self, ctx, path) -> list[tuple[str, str]]:
         """Who is heard in a version, as (speaker number, words) turns, when Nemotron is enabled in the Deepy configuration; [] otherwise."""
@@ -162,6 +161,25 @@ class WanGPHost:
         from postprocessing.seedvc_processor.bridge import SeedVCBridge
         handler = audio_processors.find_processor(audio_processors.SEEDVC_ONE_SPEAKER_METHOD)
         return "" if handler is not None and audio_processors.read_config_section(handler.server_config, handler)["mode"] == SeedVCBridge.MODE_SINGING else "Select SeedVC v1.0 Singing in Configuration > Extensions to change the singer's voice."
+
+    def upscalers(self) -> list[dict]:
+        """WanGP's spatial upsamplers that can run on a video now, each with what it does (its help) and the scales it offers (none: it has one)."""
+        from postprocessing import catalog
+        return [{"id": process["id"], "label": process["label"], "description": process["description"],
+                 "multipliers": next((parameter.get("enum") or [] for parameter in process["parameters"] if parameter["name"] == "multiplier"), [])}
+                for process in catalog.query_processes("video") if process["type"] == catalog.PROCESS_TYPE_SPATIAL_UPSAMPLING]
+
+    def upscale_video(self, path, process: str, multiplier, workspace: str, on_progress=None) -> Path:
+        """A video at a larger size, by one of WanGP's spatial upsamplers (its Late Post Processing): the same frames, sound and length."""
+        from postprocessing import spatial_upsamplers
+        value = spatial_upsamplers.build_upsampling_value(process, multiplier)
+        if not value:
+            raise ValueError(f"No upsampler {process} in this WanGP.")
+        result = self._client().web_session(workspace).submit_media_postprocessing(str(path), spatial_upsampling=value, callbacks=_Progress(on_progress)).result()
+        files = [file for file in getattr(result, "generated_files", None) or [] if str(file).lower().endswith((".mp4", ".mkv", ".mov", ".webm"))]
+        if not getattr(result, "success", False) or not files:
+            raise RuntimeError("; ".join(getattr(result, "errors", None) or []) or "The upsampler made no video.")
+        return Path(files[0])
 
     def replace_singer_voice(self, song, voice_samples, workspace: str, on_progress=None) -> Path:
         """The song sung in other voices, by WanGP's SeedVC audio processor as it is: it takes the singing out of the music, converts it and puts
@@ -211,7 +229,10 @@ class WanGPHost:
                                 "take_frames": [model_def.get("frames_minimum", 0), model_def.get("frames_steps", 1), model_def.get("fps", 16)],  # its first length and the steps after it
                                 "longest_frames": video.get("sliding_window_size") or (model_def.get("sliding_window_defaults") or {}).get("window_default"),  # the longest take of one window: past it, WanGP generates a second one
                                 "sliding_window": bool(model_def.get("sliding_window")),  # its model continues a take past one window
-                                "window_max": (model_def.get("sliding_window_defaults") or {}).get("window_max")})  # the longest one window can be
+                                "window_max": (model_def.get("sliding_window_defaults") or {}).get("window_max"),  # the longest one window can be
+                                # what its model starts or ends a video on: S a start picture, E an end picture, V the end of another video it continues
+                                "frames": "".join(letter for letter in "SEV" if letter in str(model_def.get("image_prompt_types_allowed") or "") and (letter != "V" or model_def.get("video_continuation"))),
+                                "overlap": video.get("sliding_window_overlap") or (model_def.get("sliding_window_defaults") or {}).get("overlap_default") or 1})  # the frames a continuation shares with the video it continues
         for task in EDIT_TASKS:  # Deepy's settings selected another editing model: a remake uses the first one made for it
             entries = [entry for entry in catalog if entry["task"] == task]
             if entries and not any(entry["default"] for entry in entries):

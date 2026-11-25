@@ -27,6 +27,7 @@ Supported local choices are:
 - `Qwen3.5VL Abliterated 9B`
 - `Qwen3.8VL Uncensored 27B` (supports local Deepy Prime)
 - `Qwen3.8VL Flash-Next 125B` (supports local Deepy Prime)
+- `Inkling 2 Mini VL Uncensored` (supports local Deepy Prime)
 
 For a remote Prime engine, see [Remote LLMs](REMOTE_LLMS.md). Once Deepy is enabled, **Ask Deepy** appears in the Gradio left dock. The CLI and standalone Web app use the same saved configuration.
 
@@ -447,15 +448,16 @@ This selects the language and vision model that understands requests, plans work
 
 - **Qwen3.5VL Abliterated 4B** starts quickly and uses the least memory, but is less reliable with long instructions and multi-step decisions. **Recommended for:** Deepy Zero on limited hardware and simple, direct requests.
 - **Qwen3.5VL Abliterated 9B** understands more complex instructions and media better than 4B, with higher VRAM and RAM use. **Recommended for:** the best general Deepy Zero experience when it fits comfortably.
-- **Qwen3.8VL Uncensored 27B** offers the strongest local planning, knowledge and image understanding for Deepy Prime, but needs considerably more memory and takes longer to load. On GPUs with less than 16 GB of VRAM, choose its **Bonsai 2 PTQ1_0** quantization (see below), whose weights take less than 6 GB. **Recommended for:** local Prime and complex multimedia projects.
+- **Qwen3.8VL Uncensored 27B** offers the strongest local planning, knowledge and image understanding for Deepy Prime, but needs considerably more memory and takes longer to load. On GPUs with less than 16 GB of VRAM, choose one of its **Bonsai PTQ1_0** quantizations (2.0 or 2.5, see below), whose weights take less than 6 GB. **Recommended for:** local Prime and complex multimedia projects.
 - **Qwen3.8VL Flash-Next 125B** is much larger than the VRAM of a PC: it keeps in VRAM what the current conversation uses and leaves the rest in RAM and on the drive, so it stays usable on 12 GB GPUs and gets faster as a conversation goes on. It needs an 80 GB download on a fast SSD and about 64 GB of RAM: with less, it spends its time reading the drive. Long prompts take longer to read than with the 27B. **Recommended for:** local Prime on a PC with plenty of RAM, when you want the largest local model.
+- **Inkling 2 Mini VL Uncensored** is a fast, uncensored local model for text and images, for Deepy Zero and Deepy Prime: it plans multi-step work, calls several tools in one step, reads text in screenshots and pictures, and thinks briefly before each action, so its answers start quickly. It uses about 20 GB of VRAM with its context cache (about 1 GB more with Speculative Decoding) and has a single version: a 20 GB download, no quantization to choose. **Recommended for:** local Deepy on a GPU with 24 GB of VRAM or more, when response speed matters.
 - **A remote LLM** avoids loading the language model on the WanGP GPU and may provide stronger reasoning, but adds network latency and sends conversation content to the configured provider. Remote engines require Prime. **Recommended for:** Prime when local memory is insufficient or a supported remote engine is preferred. Review [Remote LLMs](REMOTE_LLMS.md) before using one with private media or instructions.
 
 Changing the engine can require new model downloads and a runtime reload.
 
 ### Qwen LLM Quantization
 
-Quantization trades model quality for lower VRAM/RAM use. It is shown only for local Qwen engines.
+Quantization trades model quality for lower VRAM/RAM use. It is shown only for local Qwen engines. Inkling 2 Mini has a single version, shown for information.
 
 For Qwen3.5:
 
@@ -467,7 +469,8 @@ For Qwen3.8 27B:
 - **GGUF Q4** has the highest quality and memory use. **Recommended for:** quality-first work when it fits without forcing excessive unloading. Usually this will require a 24 GB VRAM GPU.
 - **GGUF IQ3_S** is the middle ground for quality and memory. **Recommended for:** most local Prime installations. You may run this version with a 16 GB VRAM GPU.
 - **GGUF Q2** has lower memory use and a larger quality loss. **Recommended for:** this version can be also used with a 16 GB VRAM GPU but the advantage over Q3 is that you will be able to expand the context window.
-- **Bonsai 2 PTQ1_0** has the lowest memory use. **Recommended for:** GPUs with less than 16 GB of VRAM. It needs the GGUF kernels 1.0.22 or newer; without them, a first launch below 16 GB stays on Qwen3.5 4B and WanGP suggests Q2 if you choose Qwen3.8.
+- **Bonsai 2.0 PTQ1_0** has the lowest memory use. Its current version (v2, a new download) finishes its reasoning before answering, where the first one often ran out of tokens while still thinking. **Recommended for:** GPUs with less than 16 GB of VRAM. It needs the GGUF kernels 1.0.22 or newer; without them, a first launch below 16 GB stays on Qwen3.5 4B and WanGP suggests Q2 if you choose Qwen3.8.
+- **Bonsai 2.5 PTQ1_0** is as light as Bonsai 2.0 and has the same requirements. It was trained further for multi-step tasks and tool calls, the kind of work Deepy Prime does in Showrunner, and comes with its own MTP drafter for Speculative Decoding. It is the official release, uncensored while it runs: WanGP removes the model's refusal direction from each layer's output, so the published weights are used unchanged. **Recommended for:** trying Deepy Prime's agent work on GPUs with less than 16 GB of VRAM; first launches still choose Bonsai 2.0.
 
 On first launch, WanGP sets up Deepy Prime on the Qwen3.8 version that suits your NVIDIA GPU, with nothing to configure, so that Showrunner works right away: Q4 from 24 GB of VRAM, IQ3_S from 16 GB, Bonsai below that, with a 64K context from 10 GB of VRAM and 32K below. Settings you have already saved are never changed. You can pick another version, but if it is less compressed than the one suited to your GPU, or if a Speculative Decoding you chose pushes the model out of VRAM, WanGP warns you that Deepy may perform poorly: in **Configuration > Deepy / Prompt Enhancer**, at the first request of a Deepy chat, and in Showrunner. The same places tell you when Speculative Decoding is Disabled although your version of Qwen3.8 fits in VRAM with MTP on your GPU, as Deepy could then run about twice as fast.
 
@@ -495,6 +498,7 @@ Choose a method and **Number of Tokens** on the row above **KV Cache Quantizatio
 - **Disabled** adds no draft-model VRAM and disables the token control. Use it when memory is tight or prediction is slower for your workload.
 - **MTP** keeps MTP on whatever the VRAM, on Qwen3.5 9B and Qwen3.8/Bonsai 27B. With **Number of Tokens** on **Auto** it uses the draft count Auto would choose for your model and GPU, including the longer prediction on easy text, and the console reports that count. It also supports a fixed 1–8 draft tokens; more are not always faster.
 - **DSpark** supports 1–7 draft tokens on Qwen3.8/Bonsai 27B when Triton and FlashAttention 2 are installed. **Auto** uses its recommended count, as it does for DFlash2 and DSpine.
+- **DSpark** is also the prediction method of **Inkling 2 Mini**, which comes with its own DSpark drafter (a 0.6 GB file, downloaded with the model when Speculative Decoding is on, and about 1 GB of VRAM with its context cache). **Auto** loads it unless the GPU has 8 GB or less or the drafter would leave too little VRAM for the model. With **Number of Tokens** on **Auto**, each prediction takes 0 to 7 draft tokens, chosen from the speed measured on your GPU while Deepy writes: tool calls, code and lists get several, while long prose, especially deep into a long conversation, gets few or none and then runs at the speed of Disabled. A fixed 1–7 is also possible. The console reports at each unload the share of predictions that used drafts and the tokens per prediction.
 - **DFlash2** supports 1–7 draft tokens on Qwen3.8 Q2, Q3 and Q4, and 1–5 on Bonsai PTQ1, when Triton and FlashAttention 2 are installed. WanGP selects the Qwen drafter for Q2/Q3/Q4 and the Bonsai-adapted drafter for PTQ1 automatically.
 
 Each method label includes its estimated additional VRAM: approximately 0.5–1 GiB for MTP and 4–5 GiB for DSpark or DFlash2 at roughly 32K context. Auto adds between zero and the MTP cost. Longer context, draft count, and model choice affect actual usage. Compare representative prompts before choosing a prediction method: Disabled can be fastest, especially with Bonsai.

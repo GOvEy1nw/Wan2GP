@@ -72,7 +72,7 @@ The production opens on its **Brief**, which saves itself as you type:
   chooses, with most shots lasting about 4 to 7 seconds. Give a range to set it yourself, such as 8 to 15 seconds for long takes (or only one end of it): long shots take longer to render, and a shot lasts at most what its model makes in one go (about 15 seconds with MiniMax H3).
 - **Voices** (not for music videos and illustrated stories): how the lines get their sound.
   - **Recorded first** (the default) records each line in its speaker's voice, and the video follows the recording. A speaker keeps one voice for the whole production, which is what long dialogue needs.
-  - **From the video model** lets the model say the lines itself, with its own sound: nothing is recorded, and no speech model is needed. Choose the language of the lines beside it, or simply ask the showrunner in the chat ("use the video model's own voices"): it switches this choice and tells you. It suits short pieces and single speakers: a speaker's voice and level can change from shot to shot (**Even voices** on the Timeline evens out the level in the export), and a line's subtitle stays up for its whole shot. Give a shot about 0.4 seconds a word plus a second, no more: with time left, the model tends to add words of its own. Each take is then listened to. Words before the first line and after the last one are cut, with the sound fading out, while a shot that adds nothing plays to its end; turn off **Cut words that are not in these lines**, under the shot's dialogue, for a shot that should run on, and a trim you set yourself always stays. A line the take got wrong, or words added between two lines, are shown on the shot: **Render again** tries another take. This only reads words, so a mumble or a laugh stays, and a cut can leave a sliver of a word. The MiniMax H3 video models can do this. When none of your templates can, lines are recorded first, and the Brief says so.
+  - **From the video model** lets the model say the lines itself, with its own sound: nothing is recorded, and no speech model is needed. Choose the language of the lines beside it, or simply ask the showrunner in the chat ("use the video model's own voices"): it switches this choice and tells you. It suits short pieces and single speakers: a speaker's voice and level can change from shot to shot (**Even voices** on the Timeline evens out the level in the export), and a line's subtitle stays up for its whole shot. Give a shot about 0.4 seconds a word plus a second, no more: with time left, the model tends to add words of its own. Each take is then listened to. Words before the first line and after the last one are cut, with the sound fading out, while a shot that adds nothing plays to its end; turn off **Cut words that are not in these lines**, under the shot's dialogue, for a shot that should run on, and a trim you set yourself always stays. A line the take got wrong, or words added between two lines, are shown on the shot: **Render again** tries another take. This only reads words, so a mumble or a laugh stays, and a cut can leave a sliver of a word. The MiniMax H3 video models can do this. When none of your templates can, lines are recorded first, and the Brief says so. For a language the model does not speak, give the shots in that language your own recordings (**Use my recording…** on a line, or **Use my audio…** for the whole shot): those shots follow them.
 - **Review the plan before shooting** (on by default): the showrunner stops after planning so that you can edit the storyboard before any
   video is generated. Turn it off to let it plan and shoot in one go.
 - **Review the takes before the edit** (off by default): the showrunner shoots and checks the shots, then waits for you instead of
@@ -176,7 +176,18 @@ is shot (hover to play it), its status and the showrunner's opinion of the take.
 - **Dialogue**: the words spoken or sung in a shot, line by line, with who says them and an optional delivery note (whispered,
   angry…). The showrunner fills them from your script and speaks each line in its speaker's voice. A line keeps its recording until
   you change its words, its note or its speaker's voice; the showrunner then speaks it again before re-shooting. The card shows the
-  first line.
+  first line. **Use my recording…** under a line takes a sound file of your own instead, recorded with another voice model or in a
+  language the video model pronounces badly: it drives the shot as a spoken line does, whatever its speaker's voice, and the showrunner
+  never records it again. It stays until you change the line's words, its note or its speaker, or remove it. With **Voices** set to
+  **From the video model**, a recording of yours still drives its shot: the model says the lines of the other shots, and this shot
+  follows your recording instead (its other lines are not said).
+- **Its audio**: **Use my audio…** under the dialogue takes one sound file of yours for the whole shot, for example a conversation made
+  with Fish Audio Drama 3 in a language the video model does not speak. The picture follows it, the lips on its words, and it stays the
+  shot's sound, in place of the lines' recordings and of what the video model would say. The shot grows to hold all of it, and its model
+  becomes one that follows audio if it was not (MiniMax H3 keeps it as the soundtrack). Keep the dialogue lines written in for the
+  subtitles. It works with every way a shot starts and ends: a shot that goes on from another hears the end of that shot first, then your
+  audio, and **Split** gives each part its own stretch of it. **Replace…** and **Remove** change it; a shot cut on the song follows the
+  song instead.
 - **Reorder** shots by dragging the cards; a shot dropped among another sequence's shots joins that sequence. Several shots can be
   selected with Ctrl or Shift and moved together; Shift selects only the shots the current filter shows.
 - **Lock** a shot (or a cast member) to keep it exactly as it is: the showrunner never changes it.
@@ -192,8 +203,21 @@ is shot (hover to play it), its status and the showrunner's opinion of the take.
   from it** (after the selected shot): it becomes a shot of its own, named after the file, with the file as its take. It plays in the
   Timeline and the edit like any other shot, and the showrunner works with it too. A shot without a take also offers **Use my video…** in its
   panel, beside **Render now**.
-- **Start and end pictures**: a shot whose video starts (or ends) on a picture shows it on its card until it has a take, and in its panel
-  under **Start picture**; click it to look at it closely.
+- **Start and end**: under its player, a shot's panel shows how it starts and how it ends. Click either one to change it:
+  - **As the prompt and references make it** (the usual way), or **a picture**: one you upload, or a picture from the bin.
+  - **The last frame of the shot before it** (to start on) or **the first frame of the shot after it** (to end on). The frame is taken when the shot
+    renders, so it follows that shot's current take and trim.
+  - **Go on from the shot before it**: the shot continues the previous one's movement and sound, as one long take. Its take holds only its own
+    frames: the frames it shares with the shot before it are left out, so the two shots join without a jump or a repeat.
+
+  Choices the shot's model cannot do are greyed out with the reason: pick a model that can (MiniMax H3, LTX-2). A model places an end picture at
+  the end of one window, about 20 s for H3. A longer shot that ends on a picture offers **Split**: its second part goes on from the first and
+  ends on the picture. A long take with several end pictures is made the same way, one continued shot for each. A shot that goes on from
+  another hears the end of that shot first: on a song, its part of the song starts where the frames they share start, and a line, your
+  own recording or your audio comes after the sound the previous shot ends on, so the lips stay on the words. The shot before it must play at least
+  those shared frames (under a second). When the shot a shot goes on
+  from, or takes a frame of, gets a new take or a new trim, its panel says so: render it again so that they join. A start picture also shows on
+  the shot's card until it has a take.
 - **Undo and redo** (Ctrl+Z, Ctrl+Shift+Z) cover every change, yours and the showrunner's, including a new take; a message says what was
   undone.
 
@@ -351,7 +375,9 @@ The panel starts open on a large screen and folded on a small one, and then stay
 icons, which also shows when the showrunner is working or waiting for you. While it is folded, double-click a shot to open it, or click an icon.
 
 In the Showrunner tab, write in plain language ("faster cuts in the chorus", "make shot 3 at night"): while it works, your message reaches it at
-its next step; otherwise it starts working on it. When shots are selected, your message is about them. The row under the input holds what you can
+its next step; otherwise it starts working on it. To ask for something once it has finished, without changing what it is doing, use the clock
+button beside **Send** (or Ctrl+Enter): the message waits above the input and starts as a task of its own when the current one ends well. Several
+wait in order, and the cross takes one back. After a stop, a pause or an error, they keep waiting. When shots are selected, your message is about them. The row under the input holds what you can
 do at that moment: **Shoot**, **Assemble** and **Re-plan**, or **Pause** and **Stop** while it works. **Stop** interrupts it; it continues where
 it stopped when you ask again.
 When a task ends, the panel says what the showrunner changed (shots added, rewritten or removed, takes shot and judged, text, sound,
@@ -392,10 +418,16 @@ home page marks the production **Changed since delivery**. **Showrunner review**
 
 - the sound in one line: the soundtrack (song, shots' sound or both) and the number of tracks laid over the edit. They are placed and
   levelled on the Timeline (**Edit on the Timeline**), where they play against the picture;
-- the subtitles the export carries as a track the viewer turns on: the shots' dialogue (spoken lines, narration and sung lyrics)
-  becomes subtitles automatically, timed on the cut and in the script's words; or add your own SRT file (it replaces the automatic
-  ones). Subtitles are never burnt into the picture.
+- the subtitles the export carries as a track the viewer turns on: the shots' dialogue (spoken lines and narration) becomes subtitles
+  automatically, timed on the cut and in the script's words; or add your own SRT file (it replaces the automatic ones). On a cut that
+  plays the song, the lines are its lyrics: they become subtitles only when **Lyrics as subtitles** is on (off by default). Subtitles are
+  never burnt into the picture. Some players show the track anyway: turn it off there.
 - the level: the whole soundtrack gets one fixed gain to a delivery loudness, with a limiter on the peaks; quiet moments stay quiet.
+
+**Upscale this version**, under a version's details, makes the same edit at a larger size with one of WanGP's upsamplers (those
+enabled in Configuration > Extensions, at the scales each offers). Faces and lips stay exactly as they are, and the new version comes
+first in **Versions** when it is ready. For more detail in every shot, Draft / Final on the Board renders the shots again at the target
+size, which upscaling cannot match.
 
 To make the video in another format, such as vertical for social networks, use **Make it in another format** on **Deliver**, or choose the ratio in the Brief and press **Make a … version**. The showrunner makes the shots again in the new format, with the same words, cast and music. Choosing a ratio alone changes nothing that is already shot. The versions you have stay as they are.
 

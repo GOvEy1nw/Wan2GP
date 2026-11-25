@@ -59,6 +59,11 @@ def resolve_backend(selection):
 
 
 def _probe_wgp_fp8():
+    from shared.kernels import startup_probes
+    return startup_probes.result("fp8", _selftest_wgp_fp8)
+
+
+def _selftest_wgp_fp8():
     """wgpkernels.fp8 when installed with its library and its selftest passes on this GPU, else None."""
     import importlib
     try:
@@ -235,6 +240,18 @@ class _FP8RowProjection:
         _, mode, dtype, fp8_dtype = _FP8RowProjection.key(module)
         x = x.to(dtype).contiguous()
         return (*_quantize_activation(x, fp8_dtype), dtype) if mode == "cuda" else x
+
+    @staticmethod
+    def block_form(module, rows):
+        """With the CUDA FP8 GEMM (torch._scaled_mm), prepare()'s form of `rows` rows ("fp8", the weight's FP8 dtype: one FP32 scale for
+        all the rows), so that an outside quantizer may make it (offload.prepare_rows: shared.kernels.norm_quant_triton's FP8 form, the norm
+        and modulation computed in FP32 without their 16-bit rows). None otherwise."""
+        _, mode, dtype, fp8_dtype = _FP8RowProjection.key(module)
+        return ("fp8", fp8_dtype) if mode == "cuda" and fp8_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else None
+
+    @staticmethod
+    def block_prepared(module, q, scales, dtype):
+        return q, scales, _FP8RowProjection.key(module)[2]
 
     @staticmethod
     def rows(module, prepared, start, stop):

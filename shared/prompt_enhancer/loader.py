@@ -44,7 +44,7 @@ def ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled: int, qwen
     if enhancer_enabled in (1, 2):
         process_files_def(**florence_llama_download_def(enhancer_enabled))
         return
-    if enhancer_enabled in (3, 4, 5, 6, 7):
+    if enhancer_enabled in (3, 4, 5, 6, 7, 8):
         from .qwen35_vl import ensure_qwen35_prompt_enhancer_assets, get_qwen35_prompt_enhancer_variant
 
         # Auto: the drafter's files whenever it may run (the choice is made at load, from the model's fit in VRAM)
@@ -140,7 +140,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
 
     ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled=enhancer_enabled, qwen_backend=qwen_backend, speculative_decoding=speculative_decoding)
 
-    if enhancer_enabled in (3, 4, 5, 6, 7):
+    if enhancer_enabled in (3, 4, 5, 6, 7, 8):
         kernels_warning = gguf_kernels_warning() if torch.cuda.is_available() else ""  # the kernels exist for NVIDIA and AMD GPUs only
         if kernels_warning:
             tqdm.write(f"\033[91m[Deepy / Prompt Enhancer] {kernels_warning}\033[0m")
@@ -153,6 +153,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
             enhancer_quantization_GGUF_Q3,
             enhancer_quantization_GGUF_Q2,
             enhancer_quantization_GGUF_PTQ1,
+            enhancer_quantization_GGUF_PTQ1_25,
             enhancer_quantization_GGUF_Q8,
             enhancer_quantization_QUANTO_INT8,
             alias_qwen35_text_embedding_for_mmgp,
@@ -161,6 +162,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
             get_qwen35_quantization,
             get_qwen35_text_gguf_path,
             get_qwen35_variant_spec,
+            load_inkling2_vl_prompt_enhancer,
             load_qwen35_vl_prompt_enhancer,
             locate_qwen35_folder,
         )
@@ -168,7 +170,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
         qwen35_variant = get_qwen35_prompt_enhancer_variant(enhancer_enabled)
         spec = get_qwen35_variant_spec(qwen35_variant)
         quantization = get_qwen35_quantization(qwen_backend or enhancer_quantization_QUANTO_INT8, variant=qwen35_variant)
-        backend = enhancer_quantization_GGUF if quantization in (enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_Q8) else quantization
+        backend = enhancer_quantization_GGUF if quantization in (enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_PTQ1_25, enhancer_quantization_GGUF_Q8) else quantization
         assets_dir_name = get_qwen35_assets_dir_name(qwen35_variant)
         assets_dir = locate_qwen35_folder(assets_dir_name) or fl.get_download_location(assets_dir_name)
         if backend == enhancer_quantization_GGUF:
@@ -217,15 +219,18 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
                 runtime.llm_model._prompt_enhancer_speculative_long_tokens = long_tokens
         runtime.llm_tokenizer = getattr(runtime.llm_model, "_prompt_enhancer_tokenizer", None)
         runtime.llm_model.eval()
-        caption_embedding_model = alias_qwen35_text_embedding_for_mmgp(runtime.llm_model)
-        runtime.image_caption_model, vision_tower_model = load_qwen35_vl_prompt_enhancer(
-            assets_dir=assets_dir,
-            attn_implementation="sdpa",
-            text_model=runtime.llm_model,
-            input_embedding_model=caption_embedding_model,
-            backend=backend,
-            variant=qwen35_variant,
-        )
+        if spec.get("architecture") == "inkling2":
+            runtime.image_caption_model, vision_tower_model, caption_embedding_model = load_inkling2_vl_prompt_enhancer(assets_dir, runtime.llm_model, variant=qwen35_variant)
+        else:
+            caption_embedding_model = alias_qwen35_text_embedding_for_mmgp(runtime.llm_model)
+            runtime.image_caption_model, vision_tower_model = load_qwen35_vl_prompt_enhancer(
+                assets_dir=assets_dir,
+                attn_implementation="sdpa",
+                text_model=runtime.llm_model,
+                input_embedding_model=caption_embedding_model,
+                backend=backend,
+                variant=qwen35_variant,
+            )
         runtime.image_caption_processor = getattr(runtime.image_caption_model, "_prompt_enhancer_processor", None)
         runtime.image_caption_model.eval()
         runtime.pipe_models["vision_tower_model"] = vision_tower_model

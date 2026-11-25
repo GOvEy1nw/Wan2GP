@@ -46,7 +46,7 @@ _rotated_triton = None  # fused ConvRot Triton kernels for large inputs (Triton 
 _column_triton = None  # the same kernels' quantizer writing in place into a ColumnInput, when WGPKernels is the backend
 _blockwise_triton = None
 _blockwise_required = False
-_kitchen_dlpack_export = None  # (Kitchen module, its own DLPack exporter) while the direct exporter replaces it
+_kitchen_dlpack_export = None  # (Kitchen module, its own DLPack exporter, its own Hadamard builder) while WanGP's replace them
 _prepared_capture_streams = set()
 # Bump when changes to INT8 custom operators invalidate compiled graphs.
 _COMPILE_CACHE_VERSION = 4
@@ -113,6 +113,11 @@ def _probe_kitchen():
 
 
 def _probe_wgpkernels():
+    from shared.kernels import startup_probes
+    return startup_probes.result("int8", _selftest_wgpkernels)
+
+
+def _selftest_wgpkernels():
     if not torch.cuda.is_available():
         return None, "requires a GPU"
     if torch.version.hip is not None and not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1201"):
@@ -1180,6 +1185,18 @@ class _WgpRowProjection:
         return prepared
 
     @staticmethod
+    def block_form(module, rows):
+        """The 'block' form (ConvRot group, 128 columns per scale) a range of `rows` rows of this module's input is prepared in, whatever its
+        values (an outside quantizer may then make it: offload.prepare_rows), None where the path is chosen on the input."""
+        _, group, precise = _WgpRowProjection.key(module)
+        return (group, 128) if not precise and rows > _wgp.DECIDE_MAX_ROWS else None
+
+    @staticmethod
+    def block_prepared(module, q, scales, dtype):
+        """The prepared input of INT8 rows q and their scales (rows, K / 128), made in the 'block' form by an outside quantizer."""
+        return _wgp.Prepared("block", q, None, scales, dtype)
+
+    @staticmethod
     def prepare_into_at(module, prepared, x, counter, first, step):
         """prepare_into of rows first + counter * step of the input (a CUDA graph loop's turn, the counter on the device), prepared the
         first range's way: x prepared on its own, then stored at those rows (the copies prepare_into makes)."""
@@ -1423,10 +1440,29 @@ class _Int8RowProjection:
     @staticmethod
     def prepare(module, x):
         from shared.qtypes.int8_convrot import _rotate_activation
-        x = _rotate_activation(x, getattr(module, "_convrot_group_size", 0))
-        if (_backend == "triton" and x.is_cuda and not triton._prefer_native_quanto_path(x)):
-            return triton._TRITON_MODULE.prepare_blockscale_input(x, module.out_features)
-        return x
+        group = getattr(module, "_convrot_group_size", 0)
+        if (_backend == "triton" and x.is_cuda and not triton._prefer_native_quanto_path(x)):  # rotated chunk by chunk, never whole in 16 bits
+            return triton._TRITON_MODULE.prepare_blockscale_input(x, module.out_features, (lambda part: _rotate_activation(part, group)) if group else None)
+        return _rotate_activation(x, group)
+
+    @staticmethod
+    def block_form(module, rows):
+        """With the Triton backend, the 'block' form (ConvRot group, the K tile of its GEMM: columns per scale) that prepare() gives `rows`
+        rows of this module's input (prepare_blockscale_input), so that an outside quantizer may make it (offload.prepare_rows: the norm,
+        modulation and quantization of shared.kernels.norm_quant_triton in one pass, the rotation in FP32 rather than 16 bits). None with
+        PyTorch, rows the native path takes, or a group or tile that quantizer does not make."""
+        group = getattr(module, "_convrot_group_size", 0)
+        if (_backend != "triton" or triton._TRITON_MODULE is None or rows <= triton._NATIVE_FALLBACK_MAX_M or group not in (0, 16, 64, 256)
+                or module.in_features % 256):
+            return None
+        block = triton._TRITON_MODULE._select_triton_int8_config(rows, module.in_features, module.out_features, device=module.qweight._data.device, kernel_kind="fused")[2]
+        return (group, block) if block in (64, 128, 256) else None
+
+    @staticmethod
+    def block_prepared(module, q, scales, dtype):
+        """prepare()'s form of INT8 rows q and their scales (rows, K / the K tile), made in the 'block' form by an outside quantizer."""
+        m, k = q.shape
+        return q, scales, dtype, triton._TRITON_MODULE._select_triton_int8_config(m, k, module.out_features, device=q.device, kernel_kind="fused")
 
     @staticmethod
     def slice_input(prepared, start, stop):  # rows of the input (offload.linear_input_rows): every row is computed on its own
@@ -1497,6 +1533,19 @@ class _KitchenRowProjection:
         return q, scales, x.dtype
 
     @staticmethod
+    def block_form(module, rows):
+        """The 'block' form (ConvRot group, 0: one FP32 scale per row) of prepare(), so that an outside quantizer may make it
+        (offload.prepare_rows: shared.kernels.norm_quant_triton, the norm, modulation, rotation and quantization in one pass, in FP32).
+        The rows count only through supports(), which chose this projection."""
+        convrot = module.weight_qtype.name == "qint8_convrot"
+        return (256 if convrot else 0, 0)
+
+    @staticmethod
+    def block_prepared(module, q, scales, dtype):
+        """prepare()'s form of INT8 rows q and their scales (rows, 1), made in the 'block' form by an outside quantizer."""
+        return q, scales, dtype
+
+    @staticmethod
     def slice_input(prepared, start, stop):  # rows of the input (offload.linear_input_rows)
         q, scales, dtype = prepared
         return q[start:stop], scales[start:stop], dtype
@@ -1532,7 +1581,7 @@ def configure(selection, verbose_level=0, *, resolved=None):
     kernel_policy.configure_families(selection)
     previous_backend = _backend
     if _kitchen_dlpack_export is not None:
-        _kitchen_dlpack_export[0]._wrap_for_dlpack = _kitchen_dlpack_export[1]
+        _kitchen_dlpack_export[0]._wrap_for_dlpack, _kitchen_dlpack_export[0]._build_hadamard = _kitchen_dlpack_export[1:]
         _kitchen_dlpack_export = None
     if _original_forward is not None:
         from optimum.quanto.tensor.weights import qbytes
@@ -1567,8 +1616,12 @@ def configure(selection, verbose_level=0, *, resolved=None):
         _kitchen = module
         _kitchen_hip = torch.version.hip is not None
         if not _kitchen_hip:
-            _kitchen_dlpack_export = (module, module._wrap_for_dlpack)
+            from shared.qtypes.int8_convrot import _regular_hadamard
+            _kitchen_dlpack_export = (module, module._wrap_for_dlpack, module._build_hadamard)
             module._wrap_for_dlpack = _export_dlpack
+            # Kitchen's unfused ConvRot route (Turing's 48 KiB shared memory, k >= 4096) reads a Hadamard from its own cache, which CUDA
+            # graphs reject: WanGP's is the same matrix, registered as a graph constant
+            module._build_hadamard = _regular_hadamard
         if not _kitchen_hip and not module._DISABLE_CUTLASS_INT8:
             capability = torch.cuda.get_device_capability()
             _sm120_cutlass = capability == (12, 0)

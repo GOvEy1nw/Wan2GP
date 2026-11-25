@@ -25,6 +25,22 @@ export async function renderNow(shotIds, final = false, newSeed = null) {
   try { await api.renderNow(state.pid, shotIds, final, newSeed); toast(shotIds.length > 1 ? `Rendering ${shotIds.length} shots…` : 'Rendering…'); } catch (error) { toast(error.message, 'error', 7000); }
 }
 
+// The shot before (-1) or after (1) this one in the edit
+function neighbour(doc, shot, step) {
+  const order = doc.shots.filter(item => item.included !== false || item.id === shot.id), index = order.indexOf(shot);
+  return order[index + step] || null;
+}
+const shotName = (doc, id) => { const shot = doc.shots.find(item => item.id === id); return shot ? `${doc.shots.indexOf(shot) + 1}${shot.title ? ` (${shot.title})` : ''}` : id; };
+
+// What a shot's template can do, as the model lists show it: a category's own name means the one Deepy's settings select
+async function templateChoice(template) {
+  try {
+    const roles = await actions.templateRoles(), choices = roles.flatMap(role => role.choices);
+    const auto = template.includes('/') ? null : roles.map(role => role.auto).find(value => value?.startsWith(`${template}/`));
+    return choices.find(choice => choice.value === (auto || template)) || null;
+  } catch { return null; }
+}
+
 const keptSeconds = (shot, take) => shot.source_range && shot.trim?.[1] != null ? shot.trim[1] - (shot.trim[0] || 0) : +take.duration_s;  // a remake's take runs on past its shot's cut: its length is what the edit keeps
 
 function loopOn() { try { return localStorage.getItem('sr.loop') === '1'; } catch { return false; } }  // off unless this viewer turned it on
@@ -68,7 +84,7 @@ export function mountInspector(root) {
         ${take && doc.brief.review_before_edit ? `<button class="btn small icon reject ${shot.status === 'rejected' && verdict?.by === 'user' ? 'active' : ''}" id="i-reject" title="Mark the take for a redo, with a note for the showrunner, and carry on reviewing">${icon('x')}</button>` : ''}
         <button class="btn small icon" id="i-more" title="More">${icon('more')}</button></div>
       <div class="player" id="i-player">${playerHtml(shot, take, compare)}</div>
-      ${remakeFrames(shot)}${startPictures(shot)}
+      ${remakeFrames(shot)}${endsField(shot, doc)}
       ${shot.takes.length ? `<div><div class="label">${icon('layers')} Takes <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">click to use · right-click to compare or remove</span></div>
         <div class="takes">${shot.source_range ? `<div class="take ${sourceOn || compare?.id === 'source' ? 'cmp' : ''}" data-source title="Your video: click to watch it here, right-click to compare it with the used take"><img src="${shot.source_poster ? actions.file(shot.source_poster) : ''}" alt=""><span class="take-label">Source</span></div>` : ''}${shot.takes.map((item, number) => `<div class="take ${item.id === take?.id ? 'on' : ''} ${item.id === compare?.id ? 'cmp' : ''}" data-take="${item.id}" title="${esc(shotText(item.note || "", doc.shots, doc.cast))} · ${item.by === 'deepy' ? 'the showrunner' : item.by === 'user' ? 'you' : item.by}">
           ${item.poster ? `<img src="${actions.file(item.poster)}" alt="">` : `<div style="aspect-ratio:16/9;${art(item.id)}"></div>`}<span class="take-label">T${number + 1}${item.kept_source ? ' · kept' : drafts && item.height ? ` · ${Math.min(item.width, item.height)}p` : item.duration_s ? ` · ${keptSeconds(shot, item).toFixed(1)}s` : ''}</span>
@@ -85,10 +101,11 @@ export function mountInspector(root) {
           ${rendering || remake ? '' : `<button class="btn" id="i-own-take" title="A video or a picture of yours as this shot's take, instead of rendering one">${icon('upload')} Use my video…</button>`}</div>`}
       ${remake ? '<div class="together-note" id="i-together" hidden></div>' : ''}
       <div class="field"><div class="label">${icon('sparkles')} What happens</div><textarea class="textarea" id="i-intent" rows="3" placeholder="${{ music_video: 'The singer turns to the camera as the chorus starts…', ad: 'The product in use, close up, the moment it pays off…', story: 'The fox finds the lantern at the edge of the wood…', remake: 'What changes in this shot: who replaces whom, what is removed or restyled…' }[doc.brief.kind] || 'She hears the radio crackle and turns to the window…'}">${esc(shot.intent)}</textarea></div>
-      <div class="field"${notForRemake}><div class="label">${icon('chat')} Dialogue <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) ? 'the video model says these words: they join the prompt when the shot renders' : 'words spoken or sung in this shot'}</span></div>
+      <div class="field"${notForRemake}><div class="label">${icon('chat')} Dialogue <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${settings.audio_guide && !shot.audio_slice ? 'the words of your audio, for the subtitles' : doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) ? 'the video model says these words: they join the prompt when the shot renders' : 'words spoken or sung in this shot'}</span></div>
         <div class="dialogue" id="i-dialogue">${(shot.dialogue || []).map(item => lineRow(item, doc)).join('')}</div>
         <button class="btn small ghost" id="i-add-line" style="align-self:flex-start">${icon('plus')} Line</button>
-        ${doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) && (shot.dialogue || []).length ? `<label class="row muted" style="font-size:12.5px;cursor:pointer;gap:10px" title="After each take, the shot starts just before its first line and ends just before any word the model adds after its last line. Turn it off for a shot that should run on."><span class="toggle ${shot.cut_extra_words !== false ? 'on' : ''}" id="i-cut-words"></span>Cut words that are not in these lines</label>` : ''}</div>
+        ${doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) && (shot.dialogue || []).length && !(settings.audio_guide && !shot.audio_slice) ? `<label class="row muted" style="font-size:12.5px;cursor:pointer;gap:10px" title="After each take, the shot starts just before its first line and ends just before any word the model adds after its last line. Turn it off for a shot that should run on."><span class="toggle ${shot.cut_extra_words !== false ? 'on' : ''}" id="i-cut-words"></span>Cut words that are not in these lines</label>` : ''}</div>
+      ${remake || shot.generation?.template === 'draw_svg' ? '' : ownAudioField(shot)}
       <details class="details" id="i-prompt-box" ${promptOpen ? 'open' : ''}><summary>${icon('chevron')} Prompt <span class="muted" id="i-count" style="font-weight:500">${remake ? 'what the model reads' : 'made from what happens, the camera and the cast'} · ${(settings.prompt || '').length} chars</span></summary>
         <textarea class="textarea" id="i-prompt" rows="6" style="margin-top:8px" placeholder="The showrunner writes the full generation prompt here. Render now makes one from what you wrote above.">${esc(settings.prompt || '')}</textarea></details>
       <div class="insp-grid">
@@ -122,12 +139,22 @@ export function mountInspector(root) {
 
   const thumb = (path, label) => `<button type="button" class="painted-thumb" data-view="${esc(path)}" data-name="${esc(label)}" title="Look at it closely"><img src="${actions.file(path)}" alt="" loading="lazy" draggable="false"><span>${label}</span></button>`;
 
-  function startPictures(shot) {  // the pictures the shot's video starts and ends on, as its settings name them
+  // How the shot starts and ends: from its prompt, on a picture, on a frame of another shot, or going on from the shot before it. A click on either opens its choices.
+  function endsField(shot, doc) {
+    if (shot.source_range || shot.generation?.template === 'draw_svg') return '';
     const settings = shot.generation?.settings || {}, first = value => (Array.isArray(value) ? value[0] : value) || null;
-    const pictures = [[first(settings.image_start), 'Start'], [first(settings.image_end), 'End']].filter(([path]) => path);
-    if (shot.source_range || !pictures.length) return '';
-    return `<div class="field"><div class="label">${icon('image')} ${pictures.length > 1 ? 'Start and end pictures' : `${pictures[0][1]} picture`} <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${pictures.length > 1 ? 'its first and last frames' : `its ${pictures[0][1] === 'Start' ? 'first' : 'last'} frame`}</span></div>
-        <div class="painted-pairs">${pictures.map(([path, label]) => thumb(path, label)).join('')}</div></div>`;
+    const side = which => {
+      const picture = first(settings[which === 'start' ? 'image_start' : 'image_end']), link = shot[which === 'start' ? 'start_from' : 'end_on'], before = neighbour(doc, shot, -1);
+      const [art, text] = which === 'start' && shot.continues ? [icon('transition'), before ? `Goes on from shot ${shotName(doc, before.id)}` : 'Goes on from the shot before it']
+        : link ? [icon('image'), `${link.at === 'end' ? 'Last' : 'First'} frame of shot ${shotName(doc, link.shot)}`]
+        : picture ? [`<img src="${actions.file(picture)}" alt="" loading="lazy" draggable="false">`, 'A picture']
+        : [icon('sparkles'), which === 'start' ? 'As the prompt and references make it' : 'Wherever the shot goes'];
+      return `<button type="button" class="end-pick" data-end="${which}" title="How this shot ${which}s: click to change"><span class="end-art">${art}</span><span class="end-text"><b>${which === 'start' ? 'Starts' : 'Ends'}</b>${esc(text)}</span></button>`;
+    };
+    return `<div class="field"><div class="label">${icon('image')} Start and end <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">its first and last frames</span></div>
+        <div class="painted-pairs">${side('start')}${side('end')}</div>
+        ${shot.stale ? `<div class="together-note">${icon('alert')}<span>${shotRefs(shot.stale, doc.shots, doc.cast)}</span></div>` : ''}
+        <div class="together-note" id="i-split" hidden></div></div>`;
   }
 
   function remakeFrames(shot) {  // a remake's shot: what the plan saw in it, the frames painted for it beside what they were painted from, and the user's own
@@ -144,6 +171,34 @@ export function mountInspector(root) {
         ${painted.length ? `<div class="painted-pairs">${painted.map(item => `${item.source ? thumb(item.source, `Source, frame ${item.frame}`) : ''}${thumb(item.path, `${item.by === 'user' ? 'Yours' : 'Painted'}, frame ${item.frame}`)}`).join('')}</div>` : ''}
         ${own}</div>
       ${shot.seen ? `<details class="details"><summary>${icon('chevron')} What the plan saw in this shot</summary><div class="muted" style="margin-top:8px;font-size:12.5px;white-space:pre-wrap">${esc(shot.seen)}</div></details>` : ''}`;
+  }
+
+  function bindEnds(shot) {
+    const id = shot.id, set = fields => actions.ops([{ op: 'update_shot', shot: id, fields }]).catch(error => toast(error.message, 'error', 7000));
+    const choice = templateChoice(shot.generation?.template || 'gen_video');
+    root.querySelectorAll('[data-end]').forEach(button => button.onclick = async () => {
+      const which = button.dataset.end, start = which === 'start', doc = state.doc, model = await choice;
+      const why = letter => model?.frames?.includes(letter) ? '' : `${model?.label || 'Its model'} cannot ${{ S: 'start on a picture', E: 'end on a picture', V: 'continue another shot' }[letter]}: choose another model below`;
+      const key = start ? 'image_start' : 'image_end', link = start ? 'start_from' : 'end_on', letter = start ? 'S' : 'E', other = neighbour(doc, shot, start ? -1 : 1);
+      const own = { [link]: null, ...(start ? { continues: false } : {}), generation: { settings: { [key]: null } } };  // every other way it started or ended goes
+      const pictures = doc.bin.filter(item => item.kind === 'image').slice(-8).reverse();
+      menu(button, [
+        { label: start ? 'As the prompt and references make it' : 'Wherever the shot goes', icon: 'sparkles', action: () => set(own) },
+        ...(start ? [{ label: other ? `Go on from shot ${shotName(doc, other.id)}` : 'Go on from the shot before it', icon: 'transition', unavailable: other ? why('V') : 'It opens the edit: no shot comes before it', action: () => set({ ...own, continues: true }) }] : []),
+        ...(other ? [{ label: start ? `Last frame of shot ${shotName(doc, other.id)}` : `First frame of shot ${shotName(doc, other.id)}`, icon: 'image', unavailable: why(letter), action: () => set({ ...own, [link]: { shot: other.id, at: start ? 'end' : 'start' } }) }] : []),
+        { label: 'Upload a picture…', icon: 'upload', unavailable: why(letter), action: async () => { const files = await pickFiles('image/*', false); if (files.length) actions.upload(files, which, id); } },
+        ...pictures.map(item => ({ label: `From the bin: ${item.name || item.path.split('/').pop()}`, icon: 'image', unavailable: why(letter), action: () => set({ ...own, generation: { settings: { [key]: item.path } } }) })),
+      ]);
+    });
+    const settings = shot.generation?.settings || {};
+    if (!settings.image_end && !shot.end_on) return;
+    choice.then(model => {  // an end picture lies past the window its model holds it in: the model would put it at the end of the first window
+      const note = root.querySelector('#i-split'), overlap = shot.continues ? model?.overlap_s || 0 : 0;
+      if (!note || !model?.window_s || +shot.duration_s + overlap <= model.window_s) return;
+      const at = Math.floor((model.window_s - overlap) * 10) / 10;
+      Object.assign(note, { hidden: false, innerHTML: `${icon('scissors')}<span class="grow">Its model ends on a picture within ${model.window_s.toFixed(1)} s. Split it at ${at} s: the second part goes on from the first and ends on the picture.</span><button class="btn small" id="i-split-do">Split</button>` });
+      note.querySelector('#i-split-do').onclick = () => actions.ops([{ op: 'split_shot', shot: id, at_s: at }]).then(() => toast('Split in two: render the first part, then the second.', 'ok')).catch(error => toast(error.message, 'error', 7000));
+    });
   }
 
   function playerHtml(shot, take, compare) {
@@ -207,7 +262,27 @@ export function mountInspector(root) {
       speaker: row.querySelector('select').value, line: row.querySelector('textarea').value, note: row.querySelector('input').value })) });
     root.querySelector('#i-dialogue').addEventListener('input', saveDialogue);
     root.querySelector('#i-dialogue').addEventListener('change', saveDialogue);
-    root.querySelector('#i-dialogue').addEventListener('click', event => { if (event.target.closest('[data-remove-line]')) { event.target.closest('.line-row').remove(); saveDialogue(); } });
+    root.querySelector('#i-dialogue').addEventListener('click', async event => {
+      if (event.target.closest('[data-remove-line]')) { event.target.closest('.line-row').remove(); saveDialogue(); return; }
+      const row = event.target.closest('.line-row'), index = [...root.querySelectorAll('#i-dialogue .line-row')].indexOf(row);
+      if (event.target.closest('[data-record-line]')) {
+        saveShot.flush();  // the line as written, before the recording is tied to its words
+        const files = await pickFiles('audio/*', false);
+        const [done] = files.length ? await actions.upload(files, 'line', `${id}:${index}`) : [];
+        if (done) toast(`Your recording drives this line.${done.template ? ` The shot now renders with ${done.template}, which follows audio.` : ''}`, 'ok', done.template ? 6000 : undefined);
+      } else if (event.target.closest('[data-unrecord-line]')) {
+        actions.ops([{ op: 'update_shot', shot: id, fields: { dialogue: shot.dialogue.map((line, number) => number === index ? { ...line, audio: null } : line) } }]);
+      }
+    });
+    const ownAudio = root.querySelector('#i-own-audio');
+    if (ownAudio) ownAudio.onclick = async () => {
+      saveShot.flush();
+      const files = await pickFiles('audio/*', false);
+      const [done] = files.length ? await actions.upload(files, 'audio', id) : [];
+      if (done) toast(`The shot follows your audio.${done.template ? ` It now renders with ${done.template}, which follows audio.` : ''}`, 'ok', done.template ? 6000 : undefined);
+    };
+    const noAudio = root.querySelector('#i-no-audio');
+    if (noAudio) noAudio.onclick = () => actions.ops([{ op: 'update_shot', shot: id, fields: { audio_part: null, generation: { settings: { audio_guide: null } } } }]).catch(error => toast(error.message, 'error', 7000));
     root.querySelector('#i-add-line').onclick = () => {  // saved once it has words
       const box = root.querySelector('#i-dialogue');
       box.insertAdjacentHTML('beforeend', lineRow({ speaker: shot.cast[0] || 'NARRATOR', line: '', note: '' }, state.doc));
@@ -266,6 +341,7 @@ export function mountInspector(root) {
       if (note !== null) actions.ops([{ op: 'verdict', shot: id, take: take.id, ok: false, note }]);
     });
     root.querySelector('#i-rerun')?.addEventListener('click', () => rerun(id));
+    bindEnds(shot);
     root.querySelector('#i-own-take')?.addEventListener('click', async () => {
       const files = await pickFiles('video/*,image/*', false);
       if (files.length && (await actions.upload(files, 'take', id)).length) toast('Your file is the take of this shot.', 'ok');
@@ -470,11 +546,26 @@ function soundField(shot, take, doc) {
 function check(ok, text) { return `<div class="check ${ok ? 'ok' : 'todo'}">${icon(ok ? 'check' : 'clock')}<span>${esc(text)}</span></div>`; }
 function stat(value, label, color) { return `<div class="panel" style="padding:12px;text-align:center"><div style="font-size:22px;font-weight:750;color:${color}">${value}</div><div class="muted" style="font-size:11.5px">${label}</div></div>`; }
 
+// The shot's own audio: a sound file of the user's (speech in any language, made with any voice model) that the picture follows and the shot keeps as its sound.
+function ownAudioField(shot) {
+  const guide = shot.generation?.settings?.audio_guide, part = shot.audio_part;
+  const label = `<div class="label">${icon('audio')} Its audio <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${shot.audio_slice ? 'its part of the song' : 'a sound file the picture follows, kept as its sound'}</span></div>`;
+  if (shot.audio_slice) return `<div class="field">${label}<div class="muted" style="font-size:12.5px">The song from ${(+shot.audio_slice[0]).toFixed(1)} s to ${(+shot.audio_slice[1]).toFixed(1)} s: its lips follow it.</div></div>`;
+  if (!guide) return `<div class="field">${label}<div class="row"><button class="btn small ghost" id="i-own-audio" title="A sound file of yours for the whole shot (dialogue made with another voice model, in another language…): the picture follows it, the lips on its words, and it stays the shot's sound. It replaces the lines' recordings and what the video model would say">${icon('upload')} Use my audio…</button></div></div>`;
+  return `<div class="field">${label}<div class="row" style="gap:6px"><audio controls preload="none" src="${actions.file(guide)}" style="height:28px;flex:1;min-width:0"></audio>
+      <button class="btn small ghost" id="i-own-audio" title="Another sound file of yours in its place">${icon('upload')} Replace…</button>
+      <button class="btn small ghost" id="i-no-audio" title="The shot follows its lines again, or what its model says">${icon('x')} Remove</button></div>
+    ${part ? `<div class="muted" style="font-size:12px">A part of a split shot: it plays ${(+part[0]).toFixed(1)} s to ${part[1] == null ? 'the end' : `${(+part[1]).toFixed(1)} s`} of this audio.</div>` : ''}</div>`;
+}
+
 function lineRow(item, doc) {
   const speakers = [...doc.cast.map(member => [member.id, member.name || member.id]), ['NARRATOR', 'Narrator']];
   if (item.speaker && !speakers.some(([value]) => value === item.speaker)) speakers.push([item.speaker, item.speaker]);
   return `<div class="line-row"><select class="select">${speakers.map(([value, label]) => `<option value="${esc(value)}" ${value === item.speaker ? 'selected' : ''}>${esc(label)}</option>`).join('')}</select>
     <button class="btn small ghost icon" data-remove-line title="Remove this line">${icon('x')}</button>
     <textarea class="textarea" rows="2" placeholder="The exact words">${esc(item.line)}</textarea>
-    <input class="input" value="${esc(item.note || '')}" placeholder="Delivery: whispered, smiling, angry…"></div>`;
+    <input class="input" value="${esc(item.note || '')}" placeholder="Delivery: whispered, smiling, angry…">
+    <div class="row" style="gap:6px;grid-column:1/-1">${item.own ? `<audio controls preload="none" src="${actions.file(item.audio)}" style="height:28px;flex:1;min-width:0"></audio>
+      <button class="btn small ghost" data-unrecord-line title="Remove your recording: the showrunner records the line again in its speaker's voice">${icon('x')} Your recording</button>`
+      : `<button class="btn small ghost" data-record-line title="A recording of this line of yours (made with another voice model, in another language…): it drives the shot instead of a recording in the speaker's voice, and the showrunner never replaces it">${icon('upload')} Use my recording…</button>`}</div></div>`;
 }
